@@ -41,7 +41,7 @@ No, you can't modify the allowed plugins list directly in the plugin's settings.
 Simply install the plugin, and it will be sent to the admin for approval. Once you approved from dashboard, It will be activated.
 
 = Where can I find more support? =
-You can find additional support on the [WordPress Support Forum](https://wordpress.org/support/plugin/plugin-security-check).
+You can find additional support on the [Codxpert Support Forum](https://codxpert.com/security-check/).
 
 == Changelog ==
 
