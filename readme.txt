@@ -1,4 +1,4 @@
-=== Security Check ===
+===Plugin Guard===
 Contributors: shadabcse2020
 Tags: security, admin, plugins management, email notifications
 Short Description: A powerful plugin that ensures only authorized plugins are active on your WordPress site, preventing unauthorized access and enhancing security.
@@ -8,7 +8,7 @@ Stable tag: 1.1
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 == Description ==
-Security Check is an essential security tool for WordPress administrators who want to ensure the integrity of their website. This plugin actively monitors the installation of new plugins and prevents unauthorized plugins from being activated without administrative approval. 
+Plugin Guard is an essential security tool for WordPress administrators who want to ensure the integrity of their website. This plugin actively monitors the installation of new plugins and prevents unauthorized plugins from being activated without administrative approval. 
 
 ### Key Features
 - Automatic Deactivation of Unauthorized Plugins**: If a new plugin is installed that is not on your approved list, the plugin will automatically deactivate it to protect your site.
