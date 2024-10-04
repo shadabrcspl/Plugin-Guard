@@ -1,14 +1,14 @@
-===Plugin Guard===
+=== Plugin Guard ===
 Contributors: shadabcse2020
 Tags: security, admin, plugins management, email notifications
 Short Description: A powerful plugin that ensures only authorized plugins are active on your WordPress site, preventing unauthorized access and enhancing security.
 Requires at least: 5.0
 Tested up to: 6.6
-Stable tag: 1.1
+Stable tag: 1.2
 License: GPLv2 or later
 License URI: http://www.gnu.org/licenses/gpl-2.0.html
 == Description ==
-Plugin Guard is an essential security tool for WordPress administrators who want to ensure the integrity of their website. This plugin actively monitors the installation of new plugins and prevents unauthorized plugins from being activated without administrative approval. 
+Security Check is an essential security tool for WordPress administrators who want to ensure the integrity of their website. This plugin actively monitors the installation of new plugins and prevents unauthorized plugins from being activated without administrative approval. 
 
 ### Key Features
 - Automatic Deactivation of Unauthorized Plugins**: If a new plugin is installed that is not on your approved list, the plugin will automatically deactivate it to protect your site.
@@ -40,11 +40,16 @@ No, you can't modify the allowed plugins list directly in the plugin's settings.
 Simply install the plugin, and it will be sent to the admin for approval. Once you approved from dashboard, It will be activated.
 
 = Where can I find more support? =
-You can find additional support on the [WordPress Support Forum](https://wordpress.org/support/plugin/plugin-security-check).
+You can find additional support on the [Codxpert Support Forum](https://github.com/shadabrcspl/Plugin-Guard).
 
 == Changelog ==
 
-= 1.1 =
+= 1.2 =
+* Added **Clear All Pending Plugins** feature for easy management of pending plugins.
+* Added the ability to Reject Plugins, which will deactivate and delete the plugin.
+* Updated email notifications to only notify once for each new plugin.
+
+= 1.1
 * Fixed issue where the plugin was requiring its own approval.
 * Excluded "Security Check" from deactivation and pending approval logic.
 * Updated version in code to reflect the latest improvements.
