@@ -1,0 +1,12 @@
+{
+  "name": "plugin-guard",
+  "version": "1.0.0",
+  "description": "A security plugin for WordPress",
+  "main": "plugin-security-check.php",
+  "scripts": {
+    "wp-env": "wp-env"
+  },
+  "devDependencies": {
+    "@wordpress/env": "^9.1.0"
+  }
+}

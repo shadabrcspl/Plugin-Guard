@@ -239,6 +239,13 @@ function reject_plugin($plugin_slug) {
 
 // Function to clear all pending approval plugins
 function clear_pending_plugins() {
+    $pending_approval_plugins = get_option('pending_approval_plugins', array());
+    if(!empty($pending_approval_plugins)) {
+        foreach($pending_approval_plugins as $plugin_slug) {
+            deactivate_plugins($plugin_slug);
+            delete_plugins(array($plugin_slug));
+        }
+    }
     // Remove the pending approval plugins option from the database
     delete_option('pending_approval_plugins');
 }
