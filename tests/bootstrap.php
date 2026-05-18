@@ -117,3 +117,81 @@ if (!class_exists('WP_Error')) {
 }
 // Include the plugin file to be tested
 require_once dirname(__DIR__) . '/plugin-security-check.php';
+if (!function_exists('get_bloginfo')) {
+    function get_bloginfo($show, $filter = 'raw') {
+        if ($show === 'version') return '6.0';
+        return '';
+    }
+}
+if (!function_exists('get_locale')) {
+    function get_locale() {
+        return 'en_US';
+    }
+}
+if (!function_exists('wp_remote_get')) {
+    function wp_remote_get($url, $args = array()) {
+        return array('response' => array('code' => 200), 'body' => '{"checksums":{"6.0":{"wp-settings.php":"fake_hash"}}}');
+    }
+}
+if (!function_exists('wp_remote_post')) {
+    function wp_remote_post($url, $args = array()) {
+         return array('response' => array('code' => 200), 'body' => '');
+    }
+}
+if (!function_exists('wp_remote_retrieve_response_code')) {
+    function wp_remote_retrieve_response_code($response) {
+        return 200;
+    }
+}
+if (!function_exists('wp_remote_retrieve_body')) {
+    function wp_remote_retrieve_body($response) {
+        return $response['body'];
+    }
+}
+if (!function_exists('is_wp_error')) {
+    function is_wp_error($thing) {
+        return false;
+    }
+}
+if (!function_exists('wp_nonce_url')) {
+    function wp_nonce_url($actionurl, $action = -1, $name = '_wpnonce') {
+        return $actionurl;
+    }
+}
+if (!function_exists('admin_url')) {
+    function admin_url($path = '', $scheme = 'admin') {
+        return 'http://example.com/wp-admin/' . $path;
+    }
+}
+// Add ABSPATH if not defined
+if (!defined('ABSPATH')) {
+    define('ABSPATH', sys_get_temp_dir() . '/');
+}
+if (!function_exists('wp_version_check')) {
+    function wp_version_check() {}
+}
+if (!function_exists('get_site_transient')) {
+    function get_site_transient($transient) {
+        if ($transient === 'update_core') {
+            $obj = new stdClass();
+            $offer = new stdClass();
+            $offer->response = 'reinstall';
+            $obj->updates = [$offer];
+            return $obj;
+        }
+        return false;
+    }
+}
+if (!class_exists('WP_Upgrader_Skin')) {
+    class WP_Upgrader_Skin {
+        public function feedback($string, ...$args) {}
+        public function header() {}
+        public function footer() {}
+    }
+}
+if (!class_exists('Core_Upgrader')) {
+    class Core_Upgrader {
+        public function __construct($skin) {}
+        public function upgrade($update, $args) { return true; }
+    }
+}
