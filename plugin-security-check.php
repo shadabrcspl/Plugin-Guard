@@ -398,15 +398,16 @@ function plugin_approval_page() {
         echo '<h2>WordPress Core Integrity Scanner</h2>';
         echo '<p>This tool checks your WordPress core files against the official checksums from WordPress.org to detect malicious modifications.</p>';
 
-        if (isset($_POST['run_core_scan'])) {
+        if (isset($_POST['run_core_scan']) && isset($_POST['psc_scanner_nonce']) && wp_verify_nonce($_POST['psc_scanner_nonce'], 'psc_run_scan')) {
             psc_run_core_checksum_scan();
         }
 
-        if (isset($_POST['repair_core'])) {
+        if (isset($_POST['repair_core']) && isset($_POST['psc_scanner_nonce']) && wp_verify_nonce($_POST['psc_scanner_nonce'], 'psc_repair_core')) {
             psc_repair_core_files();
         }
 
         echo '<form method="post" action="">';
+        wp_nonce_field('psc_run_scan', 'psc_scanner_nonce');
         echo '<p><input type="submit" name="run_core_scan" class="button button-primary" value="Scan Core Files Now"></p>';
         echo '</form>';
     }
@@ -642,26 +643,54 @@ function psc_restrict_rest_api_to_authenticated_users($result) {
 
 // Run core checksum scan
 function psc_run_core_checksum_scan() {
-    $version = get_bloginfo('version');
+    global $wp_version;
+
+    // Remove any development suffixes like -RC1 or -alpha
+    $version = preg_replace('/-.*$/', '', $wp_version);
+    if (empty($version)) {
+        $version = get_bloginfo('version');
+    }
+
     $locale = get_locale();
 
     // Fetch checksums from WP API
     $response = wp_remote_get("https://api.wordpress.org/core/checksums/1.0/?version={$version}&locale={$locale}");
+    $body = wp_remote_retrieve_body($response);
+    $data = json_decode($body, true);
+
+    // Fallback to en_US if local translation checksums are missing
+    if (empty($data['checksums']) || empty($data['checksums'][$version])) {
+        $response = wp_remote_get("https://api.wordpress.org/core/checksums/1.0/?version={$version}&locale=en_US");
+        $body = wp_remote_retrieve_body($response);
+        $data = json_decode($body, true);
+    }
 
     if (is_wp_error($response)) {
         echo '<div class="error"><p>Failed to connect to WordPress.org API to fetch checksums.</p></div>';
         return;
     }
 
-    $body = wp_remote_retrieve_body($response);
-    $data = json_decode($body, true);
-
-    if (empty($data['checksums']) || empty($data['checksums'][$version])) {
-        echo '<div class="error"><p>Could not retrieve checksums for WordPress version ' . esc_html($version) . '.</p></div>';
-        return;
+    // If exact version fails, try to grab the latest minor release for that major version
+    $checksums = array();
+    if (!empty($data['checksums']) && is_array($data['checksums'])) {
+        if (isset($data['checksums'][$version])) {
+            $checksums = $data['checksums'][$version];
+        } else {
+            // Fallback: Just grab the first available version from the API response
+            // Since we queried specifically for the version, if they return anything, it's the closest match.
+            reset($data['checksums']);
+            $closest_version = key($data['checksums']);
+            if ($closest_version) {
+                $checksums = $data['checksums'][$closest_version];
+                echo '<div class="notice notice-warning"><p>Could not find exact checksums for ' . esc_html($version) . '. Falling back to ' . esc_html($closest_version) . '.</p></div>';
+            }
+        }
     }
 
-    $checksums = $data['checksums'][$version];
+    if (empty($checksums)) {
+        echo '<div class="error"><p>Could not retrieve checksums for WordPress version ' . esc_html($version) . '. This can happen if you are running an unofficial or beta version of WordPress.</p></div>';
+        return;
+    }
     $modified_files = array();
     $missing_files = array();
 
@@ -712,6 +741,7 @@ function psc_run_core_checksum_scan() {
         echo '<div style="background:#fcebea; border-left:4px solid #dc3232; padding:10px; margin-top:20px;">';
         echo '<p><strong>Warning:</strong> Core file modifications often indicate a hacked website. If you did not intentionally modify these files, you should repair your core files immediately.</p>';
         echo '<form method="post" action="" onsubmit="return confirm(\'Are you sure you want to reinstall WordPress core? This will overwrite any custom modifications you have made to core files.\');">';
+        wp_nonce_field('psc_repair_core', 'psc_scanner_nonce');
         echo '<input type="submit" name="repair_core" class="button button-primary" style="background:#dc3232; border-color:#dc3232;" value="Repair Core Files Now">';
         echo '</form>';
         echo '</div>';

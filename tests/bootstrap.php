@@ -195,3 +195,15 @@ if (!class_exists('Core_Upgrader')) {
         public function upgrade($update, $args) { return true; }
     }
 }
+if (!function_exists('wp_verify_nonce')) {
+    function wp_verify_nonce($nonce, $action = -1) {
+        return true;
+    }
+}
+if (!function_exists('wp_nonce_field')) {
+    function wp_nonce_field($action = -1, $name = "_wpnonce", $referer = true, $echo = true) {
+        $field = '<input type="hidden" name="' . esc_attr($name) . '" value="fake_nonce" />';
+        if ($echo) echo $field;
+        return $field;
+    }
+}
