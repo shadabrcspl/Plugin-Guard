@@ -115,83 +115,68 @@ if (!class_exists('WP_Error')) {
         public function __construct($code = '', $message = '', $data = '') {}
     }
 }
+
+if (!function_exists('get_theme_root')) {
+    function get_theme_root() {
+        return sys_get_temp_dir() . '/wp-content/themes';
+    }
+}
+if (!function_exists('get_userdata')) {
+    function get_userdata($id) {
+        $user = new stdClass();
+        $user->user_login = 'testadmin';
+        $user->user_email = 'test@example.com';
+        $user->roles = ['administrator'];
+        return $user;
+    }
+}
+if (!function_exists('wp_mail')) {
+    function wp_mail() {
+        return true;
+    }
+}
+if (!function_exists('wp_next_scheduled')) {
+    function wp_next_scheduled($hook) {
+        return false;
+    }
+}
+if (!function_exists('wp_schedule_event')) {
+    function wp_schedule_event($timestamp, $recurrence, $hook, $args = array()) {
+        return true;
+    }
+}
+if (!function_exists('remove_query_arg')) {
+    function remove_query_arg($key, $query) {
+        return str_replace('?ver=1.0', '', $query);
+    }
+}
+global $table_prefix;
+$table_prefix = 'wp_';
+
 // Include the plugin file to be tested
-require_once dirname(__DIR__) . '/plugin-security-check.php';
-if (!function_exists('get_bloginfo')) {
-    function get_bloginfo($show, $filter = 'raw') {
-        if ($show === 'version') return '6.0';
-        return '';
+
+require_once dirname(__DIR__) . '/plugin-security-check.php';if (!function_exists('_get_cron_array')) {
+    function _get_cron_array() { return array(); }
+}
+if (!function_exists('get_users')) {
+    function get_users($args = array()) {
+        $user = new stdClass();
+        $user->ID = 1;
+        $user->user_login = 'admin';
+        return array($user);
     }
 }
-if (!function_exists('get_locale')) {
-    function get_locale() {
-        return 'en_US';
+if (!class_exists('WP_User')) {
+    class WP_User {
+        public function __construct($id) {}
+        public function remove_role($role) {}
+        public function add_role($role) {}
     }
 }
-if (!function_exists('wp_remote_get')) {
-    function wp_remote_get($url, $args = array()) {
-        return array('response' => array('code' => 200), 'body' => '{"checksums":{"6.0":{"wp-settings.php":"fake_hash"}}}');
-    }
+if (!function_exists('update_user_meta')) {
+    function update_user_meta($user_id, $meta_key, $meta_value, $prev_value = '') { return true; }
 }
-if (!function_exists('wp_remote_post')) {
-    function wp_remote_post($url, $args = array()) {
-         return array('response' => array('code' => 200), 'body' => '');
-    }
-}
-if (!function_exists('wp_remote_retrieve_response_code')) {
-    function wp_remote_retrieve_response_code($response) {
-        return 200;
-    }
-}
-if (!function_exists('wp_remote_retrieve_body')) {
-    function wp_remote_retrieve_body($response) {
-        return $response['body'];
-    }
-}
-if (!function_exists('is_wp_error')) {
-    function is_wp_error($thing) {
-        return false;
-    }
-}
-if (!function_exists('wp_nonce_url')) {
-    function wp_nonce_url($actionurl, $action = -1, $name = '_wpnonce') {
-        return $actionurl;
-    }
-}
-if (!function_exists('admin_url')) {
-    function admin_url($path = '', $scheme = 'admin') {
-        return 'http://example.com/wp-admin/' . $path;
-    }
-}
-// Add ABSPATH if not defined
-if (!defined('ABSPATH')) {
-    define('ABSPATH', sys_get_temp_dir() . '/');
-}
-if (!function_exists('wp_version_check')) {
-    function wp_version_check() {}
-}
-if (!function_exists('get_site_transient')) {
-    function get_site_transient($transient) {
-        if ($transient === 'update_core') {
-            $obj = new stdClass();
-            $offer = new stdClass();
-            $offer->response = 'reinstall';
-            $obj->updates = [$offer];
-            return $obj;
-        }
-        return false;
-    }
-}
-if (!class_exists('WP_Upgrader_Skin')) {
-    class WP_Upgrader_Skin {
-        public function feedback($string, ...$args) {}
-        public function header() {}
-        public function footer() {}
-    }
-}
-if (!class_exists('Core_Upgrader')) {
-    class Core_Upgrader {
-        public function __construct($skin) {}
-        public function upgrade($update, $args) { return true; }
-    }
-}
+global $wpdb;
+$wpdb = new stdClass();
+$wpdb->options = 'wp_options';
+$wpdb->get_results = function($query) { return array(); };
