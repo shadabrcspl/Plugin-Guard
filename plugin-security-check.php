@@ -228,6 +228,8 @@ function plugin_approval_page() {
             update_option('psc_prevent_enumeration', isset($_POST['psc_prevent_enumeration']) ? 'yes' : 'no');
             update_option('psc_disable_directory_browsing', isset($_POST['psc_disable_directory_browsing']) ? 'yes' : 'no');
             update_option('psc_protect_wpconfig', isset($_POST['psc_protect_wpconfig']) ? 'yes' : 'no');
+            update_option('psc_disable_app_passwords', isset($_POST['psc_disable_app_passwords']) ? 'yes' : 'no');
+            update_option('psc_restrict_rest_api', isset($_POST['psc_restrict_rest_api']) ? 'yes' : 'no');
 
             // Update root .htaccess based on new settings
             psc_update_root_htaccess();
@@ -264,6 +266,12 @@ function plugin_approval_page() {
 
         echo '<tr><th scope="row">Protect wp-config.php</th>';
         echo '<td><label><input type="checkbox" name="psc_protect_wpconfig" value="1" ' . checked(get_option('psc_protect_wpconfig', 'no'), 'yes', false) . '> Block web access to wp-config.php</label></td></tr>';
+
+        echo '<tr><th scope="row">Disable Application Passwords</th>';
+        echo '<td><label><input type="checkbox" name="psc_disable_app_passwords" value="1" ' . checked(get_option('psc_disable_app_passwords', 'no'), 'yes', false) . '> Disable Application Passwords for REST API authentication</label></td></tr>';
+
+        echo '<tr><th scope="row">Restrict REST API</th>';
+        echo '<td><label><input type="checkbox" name="psc_restrict_rest_api" value="1" ' . checked(get_option('psc_restrict_rest_api', 'no'), 'yes', false) . '> Restrict the entire REST API to logged-in users only</label></td></tr>';
 
         echo '</table>';
         echo '<p class="submit"><input type="submit" name="save_security_settings" class="button button-primary" value="Save Settings"></p>';
@@ -473,3 +481,22 @@ function psc_remove_root_htaccess_rules() {
     }
 }
 register_deactivation_hook(__FILE__, 'psc_remove_root_htaccess_rules');
+
+// Disable Application Passwords
+if (get_option('psc_disable_app_passwords', 'no') === 'yes') {
+    add_filter('wp_is_application_passwords_available', '__return_false');
+}
+
+// Restrict REST API to Authenticated Users Only
+if (get_option('psc_restrict_rest_api', 'no') === 'yes') {
+    add_filter('rest_authentication_errors', 'psc_restrict_rest_api_to_authenticated_users');
+    function psc_restrict_rest_api_to_authenticated_users($result) {
+        if (!empty($result)) {
+            return $result;
+        }
+        if (!is_user_logged_in()) {
+            return new WP_Error('rest_not_logged_in', 'You are not currently logged in. The REST API is restricted to authenticated users.', array('status' => 401));
+        }
+        return $result;
+    }
+}
