@@ -421,25 +421,25 @@ if (get_option('psc_prevent_enumeration', 'no') === 'yes') {
             add_action('template_redirect', 'psc_block_user_enumeration');
         }
     }
-
-    function psc_block_user_enumeration() {
-        if (is_author()) {
-            wp_redirect(home_url(), 301);
-            die();
-        }
-    }
-
     // Block REST API user enumeration
     add_filter('rest_endpoints', 'psc_block_rest_user_enumeration');
-    function psc_block_rest_user_enumeration($endpoints) {
-        if (isset($endpoints['/wp/v2/users'])) {
-            unset($endpoints['/wp/v2/users']);
-        }
-        if (isset($endpoints['/wp/v2/users/(?P<id>[\d]+)'])) {
-            unset($endpoints['/wp/v2/users/(?P<id>[\d]+)']);
-        }
-        return $endpoints;
+}
+
+function psc_block_user_enumeration() {
+    if (is_author()) {
+        wp_redirect(home_url(), 301);
+        die();
     }
+}
+
+function psc_block_rest_user_enumeration($endpoints) {
+    if (isset($endpoints['/wp/v2/users'])) {
+        unset($endpoints['/wp/v2/users']);
+    }
+    if (isset($endpoints['/wp/v2/users/(?P<id>[\d]+)'])) {
+        unset($endpoints['/wp/v2/users/(?P<id>[\d]+)']);
+    }
+    return $endpoints;
 }
 
 // Write .htaccess rules for Directory Browsing and wp-config.php protection
@@ -490,13 +490,14 @@ if (get_option('psc_disable_app_passwords', 'no') === 'yes') {
 // Restrict REST API to Authenticated Users Only
 if (get_option('psc_restrict_rest_api', 'no') === 'yes') {
     add_filter('rest_authentication_errors', 'psc_restrict_rest_api_to_authenticated_users');
-    function psc_restrict_rest_api_to_authenticated_users($result) {
-        if (!empty($result)) {
-            return $result;
-        }
-        if (!is_user_logged_in()) {
-            return new WP_Error('rest_not_logged_in', 'You are not currently logged in. The REST API is restricted to authenticated users.', array('status' => 401));
-        }
+}
+
+function psc_restrict_rest_api_to_authenticated_users($result) {
+    if (!empty($result)) {
         return $result;
     }
+    if (!is_user_logged_in()) {
+        return new WP_Error('rest_not_logged_in', 'You are not currently logged in. The REST API is restricted to authenticated users.', array('status' => 401));
+    }
+    return $result;
 }
