@@ -327,6 +327,26 @@ function plugin_approval_page() {
                 unlink($test_file_path);
             }
 
+            // Test 6: Disable Plugin/Theme Installation
+            $file_mods_disabled = (defined('DISALLOW_FILE_MODS') && DISALLOW_FILE_MODS === true);
+            $status = $file_mods_disabled ? '<span style="color:green">Protected (Disabled)</span>' : '<span style="color:red">Vulnerable (Enabled)</span>';
+            echo "<p><strong>Plugin/Theme Installation:</strong> $status</p>";
+
+            // Test 7: Hide WordPress Version
+            $response = wp_remote_get(home_url('/'), array('timeout' => 5));
+            if (!is_wp_error($response)) {
+                $body = wp_remote_retrieve_body($response);
+                $has_generator = (strpos($body, '<meta name="generator" content="WordPress') !== false);
+                // A simplistic check to see if scripts/styles have the default WP version appended
+                global $wp_version;
+                $has_version_args = (strpos($body, '?ver=' . $wp_version) !== false);
+
+                $status = (!$has_generator && !$has_version_args) ? '<span style="color:green">Protected (Hidden)</span>' : '<span style="color:red">Vulnerable (Visible)</span>';
+                echo "<p><strong>WordPress Version Visibility:</strong> $status</p>";
+            } else {
+                echo "<p><strong>WordPress Version Visibility:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
+            }
+
             echo '</div>';
         }
 
