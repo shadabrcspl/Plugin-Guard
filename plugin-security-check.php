@@ -12,10 +12,23 @@
 // Store initial active plugins on activation
 function store_initial_active_plugins() {
     $active_plugins = get_option('active_plugins');
+    if (!is_array($active_plugins)) {
+        $active_plugins = array();
+    }
 
-    // Check if allowed_plugins option is already set, otherwise initialize
-    if (!get_option('allowed_plugins')) {
+    $plugin_file = plugin_basename(__FILE__);
+    if (!in_array($plugin_file, $active_plugins)) {
+        $active_plugins[] = $plugin_file;
+    }
+
+    $allowed_plugins = get_option('allowed_plugins');
+    if (!$allowed_plugins) {
         update_option('allowed_plugins', $active_plugins);
+    } else {
+        if (!in_array($plugin_file, $allowed_plugins)) {
+            $allowed_plugins[] = $plugin_file;
+            update_option('allowed_plugins', $allowed_plugins);
+        }
     }
 }
 register_activation_hook(__FILE__, 'store_initial_active_plugins');
@@ -32,7 +45,7 @@ function check_for_unauthorized_plugins() {
         // Deactivate the unauthorized plugins
         foreach ($new_plugins as $plugin) {
             // Skip deactivation for the Plugin Security Check itself
-            if ($plugin === 'plugin-security-check/plugin-security-check.php') {
+            if ($plugin === plugin_basename(__FILE__)) {
                 continue;
             }
             deactivate_plugins($plugin);
@@ -40,7 +53,7 @@ function check_for_unauthorized_plugins() {
 
         // Store the new plugins pending approval, excluding this plugin
         $pending_approval_plugins = get_option('pending_approval_plugins', array());
-        $pending_approval_plugins = array_merge($pending_approval_plugins, array_diff($new_plugins, array('plugin-security-check/plugin-security-check.php')));
+        $pending_approval_plugins = array_merge($pending_approval_plugins, array_diff($new_plugins, array(plugin_basename(__FILE__))));
         update_option('pending_approval_plugins', $pending_approval_plugins);
 
         // Send email to admin for approval
@@ -55,7 +68,7 @@ function prevent_activation_without_approval($plugin) {
     $pending_approval_plugins = get_option('pending_approval_plugins', array());
 
     // Check if the plugin is the Plugin Security Check itself
-    if ($plugin === 'plugin-security-check/plugin-security-check.php') {
+    if ($plugin === plugin_basename(__FILE__)) {
         return; // Skip validation for this plugin
     }
 
@@ -97,7 +110,7 @@ function send_plugin_approval_email($new_plugins) {
 
     foreach ($new_plugins as $plugin) {
         // Skip sending email for the Plugin Security Check itself
-        if ($plugin === 'plugin-security-check/plugin-security-check.php') {
+        if ($plugin === plugin_basename(__FILE__)) {
             continue;
         }
 
