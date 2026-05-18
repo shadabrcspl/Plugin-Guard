@@ -363,6 +363,36 @@ function plugin_approval_page() {
         echo '<p class="submit"><input type="submit" name="run_security_tests" class="button button-secondary" value="Run Manual Security Tests"></p>';
         echo '<p class="description">This will make loopback requests to your site to check if the protections are actively blocking access.</p>';
         echo '</form>';
+
+        // NGINX Rules Section
+        $is_nginx = (strpos($_SERVER['SERVER_SOFTWARE'] ?? '', 'nginx') !== false);
+        if ($is_nginx || isset($_POST['show_nginx_rules'])) {
+            echo '<hr>';
+            echo '<h3>NGINX Server Configuration</h3>';
+            echo '<p>It appears you are running NGINX (or requested NGINX rules). NGINX ignores `.htaccess` files. For the <strong>Secure Uploads Directory</strong> and <strong>Protect wp-config.php</strong> settings to work, you must manually add the following rules to your server configuration block (usually located in <code>/etc/nginx/sites-available/</code>) inside the <code>server { ... }</code> block:</p>';
+
+            $nginx_rules = "# Plugin Security Check Rules\n";
+            if (get_option('psc_protect_wpconfig', 'no') === 'yes') {
+                $nginx_rules .= "location ~* wp-config.php {\n    deny all;\n}\n";
+            }
+            if ($is_uploads_secure) {
+                $nginx_rules .= "location ~* /wp-content/uploads/.*\\.php$ {\n    deny all;\n}\n";
+            }
+            if (get_option('psc_disable_directory_browsing', 'no') === 'yes') {
+                $nginx_rules .= "autoindex off;\n";
+            }
+            if (trim($nginx_rules) === "# Plugin Security Check Rules") {
+                $nginx_rules .= "# Enable settings above to generate rules.\n";
+            }
+
+            echo '<textarea readonly style="width:100%; height:150px; font-family:monospace; background:#f0f0f1;">' . esc_textarea($nginx_rules) . '</textarea>';
+            echo '<p class="description">After adding these rules, remember to reload NGINX (e.g., <code>sudo systemctl reload nginx</code>).</p>';
+        } elseif (!$is_nginx) {
+            echo '<hr>';
+            echo '<form method="post" action="">';
+            echo '<p class="submit"><input type="submit" name="show_nginx_rules" class="button button-secondary" value="Show NGINX Rules"></p>';
+            echo '</form>';
+        }
     }
     echo '</div>'; // Close .wrap
 }
