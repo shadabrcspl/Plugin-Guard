@@ -163,6 +163,7 @@ function plugin_approval_page() {
     echo '<h2 class="nav-tab-wrapper">';
     echo '<a href="?page=plugin-approvals&tab=approvals" class="nav-tab ' . ($active_tab == 'approvals' ? 'nav-tab-active' : '') . '">Plugin Approvals</a>';
     echo '<a href="?page=plugin-approvals&tab=security" class="nav-tab ' . ($active_tab == 'security' ? 'nav-tab-active' : '') . '">Security Settings</a>';
+    echo '<a href="?page=plugin-approvals&tab=scanner" class="nav-tab ' . ($active_tab == 'scanner' ? 'nav-tab-active' : '') . '">Core Scanner</a>';
     echo '</h2>';
 
     if ($active_tab == 'approvals') {
@@ -393,6 +394,21 @@ function plugin_approval_page() {
             echo '<p class="submit"><input type="submit" name="show_nginx_rules" class="button button-secondary" value="Show NGINX Rules"></p>';
             echo '</form>';
         }
+    } elseif ($active_tab == 'scanner') {
+        echo '<h2>WordPress Core Integrity Scanner</h2>';
+        echo '<p>This tool checks your WordPress core files against the official checksums from WordPress.org to detect malicious modifications.</p>';
+
+        if (isset($_POST['run_core_scan'])) {
+            psc_run_core_checksum_scan();
+        }
+
+        if (isset($_POST['repair_core'])) {
+            psc_repair_core_files();
+        }
+
+        echo '<form method="post" action="">';
+        echo '<p><input type="submit" name="run_core_scan" class="button button-primary" value="Scan Core Files Now"></p>';
+        echo '</form>';
     }
     echo '</div>'; // Close .wrap
 }
@@ -622,4 +638,142 @@ function psc_restrict_rest_api_to_authenticated_users($result) {
         return new WP_Error('rest_not_logged_in', 'You are not currently logged in. The REST API is restricted to authenticated users.', array('status' => 401));
     }
     return $result;
+}
+
+// Run core checksum scan
+function psc_run_core_checksum_scan() {
+    $version = get_bloginfo('version');
+    $locale = get_locale();
+
+    // Fetch checksums from WP API
+    $response = wp_remote_get("https://api.wordpress.org/core/checksums/1.0/?version={$version}&locale={$locale}");
+
+    if (is_wp_error($response)) {
+        echo '<div class="error"><p>Failed to connect to WordPress.org API to fetch checksums.</p></div>';
+        return;
+    }
+
+    $body = wp_remote_retrieve_body($response);
+    $data = json_decode($body, true);
+
+    if (empty($data['checksums']) || empty($data['checksums'][$version])) {
+        echo '<div class="error"><p>Could not retrieve checksums for WordPress version ' . esc_html($version) . '.</p></div>';
+        return;
+    }
+
+    $checksums = $data['checksums'][$version];
+    $modified_files = array();
+    $missing_files = array();
+
+    foreach ($checksums as $file => $expected_hash) {
+        $local_file_path = ABSPATH . $file;
+
+        // Skip wp-config-sample.php as it's often modified/deleted harmlessly
+        if ($file === 'wp-config-sample.php') {
+            continue;
+        }
+
+        if (!file_exists($local_file_path)) {
+            $missing_files[] = $file;
+        } else {
+            $local_hash = md5_file($local_file_path);
+            if ($local_hash !== $expected_hash) {
+                $modified_files[] = $file;
+            }
+        }
+    }
+
+    echo '<div class="notice notice-info" style="padding:15px; margin-top:20px;">';
+    echo '<h3>Scan Results for WordPress ' . esc_html($version) . '</h3>';
+
+    $has_issues = false;
+
+    if (!empty($modified_files)) {
+        $has_issues = true;
+        echo '<h4 style="color:red;">Modified Core Files:</h4><ul>';
+        foreach ($modified_files as $file) {
+            echo '<li><code>' . esc_html($file) . '</code></li>';
+        }
+        echo '</ul>';
+    }
+
+    if (!empty($missing_files)) {
+        $has_issues = true;
+        echo '<h4 style="color:orange;">Missing Core Files:</h4><ul>';
+        foreach ($missing_files as $file) {
+            echo '<li><code>' . esc_html($file) . '</code></li>';
+        }
+        echo '</ul>';
+    }
+
+    if (!$has_issues) {
+        echo '<p style="color:green; font-weight:bold;">Success! All WordPress core files match the official repository. No modifications detected.</p>';
+    } else {
+        echo '<div style="background:#fcebea; border-left:4px solid #dc3232; padding:10px; margin-top:20px;">';
+        echo '<p><strong>Warning:</strong> Core file modifications often indicate a hacked website. If you did not intentionally modify these files, you should repair your core files immediately.</p>';
+        echo '<form method="post" action="" onsubmit="return confirm(\'Are you sure you want to reinstall WordPress core? This will overwrite any custom modifications you have made to core files.\');">';
+        echo '<input type="submit" name="repair_core" class="button button-primary" style="background:#dc3232; border-color:#dc3232;" value="Repair Core Files Now">';
+        echo '</form>';
+        echo '</div>';
+    }
+    echo '</div>';
+}
+
+// Reinstall WordPress Core to fix modified/missing files
+function psc_repair_core_files() {
+    // Make sure we have the required files loaded for the Upgrader
+    require_once(ABSPATH . 'wp-admin/includes/class-wp-upgrader.php');
+    require_once(ABSPATH . 'wp-admin/includes/update.php');
+
+    // Check if user has permission
+    if (!current_user_can('update_core')) {
+        echo '<div class="error"><p>You do not have sufficient permissions to update core files.</p></div>';
+        return;
+    }
+
+    echo '<div class="updated" style="padding:15px; margin-top:20px;">';
+    echo '<h3>Repairing Core Files...</h3>';
+
+    // We need to flush the update cache to ensure we get a download link
+    wp_version_check();
+
+    $current = get_site_transient('update_core');
+    if (!isset($current->updates) || !is_array($current->updates)) {
+        echo '<p>Could not find WordPress updates. Please try again later.</p>';
+        echo '</div>';
+        return;
+    }
+
+    // Find the update object for the current version to reinstall
+    $update = $current->updates[0];
+    foreach ($current->updates as $offer) {
+        if ($offer->response === 'reinstall') {
+            $update = $offer;
+            break;
+        }
+    }
+
+    // Suppress normal upgrader output by using a quiet skin
+    if (!class_exists('PSC_Quiet_Upgrader_Skin')) {
+        class PSC_Quiet_Upgrader_Skin extends WP_Upgrader_Skin {
+            public function feedback($string, ...$args) { /* Quiet */ }
+            public function header() { /* Quiet */ }
+            public function footer() { /* Quiet */ }
+        }
+    }
+
+    $skin = new PSC_Quiet_Upgrader_Skin();
+    $upgrader = new Core_Upgrader($skin);
+
+    $result = $upgrader->upgrade($update, array(
+        'allow_relaxed_file_ownership' => true,
+        'clear_update_cache' => true
+    ));
+
+    if (is_wp_error($result)) {
+        echo '<p style="color:red;">Repair failed: ' . esc_html($result->get_error_message()) . '</p>';
+    } else {
+        echo '<p style="color:green; font-weight:bold;">Core files successfully repaired! WordPress has been reinstalled.</p>';
+    }
+    echo '</div>';
 }
