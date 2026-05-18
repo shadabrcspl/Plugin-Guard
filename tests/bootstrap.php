@@ -45,5 +45,13 @@ if (!function_exists('plugin_basename')) {
         return basename($file);
     }
 }
+if (!function_exists('register_deactivation_hook')) {
+    function register_deactivation_hook($file, $function) {}
+}
+if (!function_exists('wp_upload_dir')) {
+    function wp_upload_dir() {
+        return ['basedir' => sys_get_temp_dir() . '/wp-content/uploads'];
+    }
+}
 // Include the plugin file to be tested
 require_once dirname(__DIR__) . '/plugin-security-check.php';
