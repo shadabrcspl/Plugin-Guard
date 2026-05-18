@@ -291,3 +291,50 @@ function prevent_unauthorized_plugin_installation($response, $hook_extra) {
     return $response;
 }
 add_filter('upgrader_pre_install', 'prevent_unauthorized_plugin_installation', 10, 2);
+
+// Disable Theme and Plugin Editor
+if (!defined('DISALLOW_FILE_EDIT')) {
+    define('DISALLOW_FILE_EDIT', true);
+}
+
+// Disable PHP execution in the uploads directory
+function secure_uploads_directory() {
+    $upload_dir = wp_upload_dir();
+    $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
+
+    $rules = "<Files *.php>\nDeny from all\n</Files>";
+
+    if (!file_exists($htaccess_file)) {
+        file_put_contents($htaccess_file, $rules);
+    } else {
+        $content = file_get_contents($htaccess_file);
+        if (strpos($content, '<Files *.php>') === false) {
+            file_put_contents($htaccess_file, $rules . "\n" . $content);
+        }
+    }
+}
+register_activation_hook(__FILE__, 'secure_uploads_directory');
+
+// Revert PHP execution disabling in the uploads directory on deactivation
+function remove_secure_uploads_directory() {
+    $upload_dir = wp_upload_dir();
+    $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
+
+    if (file_exists($htaccess_file)) {
+        $content = file_get_contents($htaccess_file);
+        $rules = "<Files *.php>\nDeny from all\n</Files>\n";
+        $new_content = str_replace($rules, '', $content);
+
+        // Also check if it was added without a trailing newline
+        $rules_no_newline = "<Files *.php>\nDeny from all\n</Files>";
+        $new_content = str_replace($rules_no_newline, '', $new_content);
+
+        // If the file is now empty or just whitespace, delete it
+        if (trim($new_content) === '') {
+            unlink($htaccess_file);
+        } else {
+            file_put_contents($htaccess_file, $new_content);
+        }
+    }
+}
+register_deactivation_hook(__FILE__, 'remove_secure_uploads_directory');
