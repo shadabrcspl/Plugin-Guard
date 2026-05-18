@@ -269,3 +269,25 @@ function clear_pending_plugins() {
 //    wp_schedule_event(time(), 'daily', 'daily_plugin_check_event');
 // }
 // add_action('daily_plugin_check_event', 'check_for_unauthorized_plugins');
+
+// Prevent unauthorized user creation
+function prevent_unauthorized_user_creation($user_id) {
+    if (!current_user_can('create_users') && !get_option('users_can_register')) {
+        require_once(ABSPATH . 'wp-admin/includes/user.php');
+        wp_delete_user($user_id);
+        error_log("Unauthorized user creation blocked and user deleted: ID $user_id");
+    }
+}
+add_action('user_register', 'prevent_unauthorized_user_creation');
+
+// Prevent unauthorized plugin installation
+function prevent_unauthorized_plugin_installation($response, $hook_extra) {
+    if (isset($hook_extra['type']) && $hook_extra['type'] === 'plugin' && $hook_extra['action'] === 'install') {
+        if (!current_user_can('install_plugins')) {
+            error_log("Unauthorized plugin installation attempt blocked.");
+            return new WP_Error('unauthorized_install', 'You are not authorized to install plugins.');
+        }
+    }
+    return $response;
+}
+add_filter('upgrader_pre_install', 'prevent_unauthorized_plugin_installation', 10, 2);
