@@ -105,17 +105,15 @@ if (!function_exists('esc_attr')) {
     }
 }
 
-// Include the plugin file to be tested
-require_once dirname(__DIR__) . '/plugin-security-check.php';
-if (!function_exists('checked')) {
-    function checked($checked, $current = true, $echo = true) {
-        $result = '';
-        if ((string)$checked === (string)$current) {
-            $result = " checked='checked'";
-        }
-        if ($echo) {
-            echo $result;
-        }
-        return $result;
+if (!function_exists('is_user_logged_in')) {
+    function is_user_logged_in() {
+        return false;
     }
 }
+if (!class_exists('WP_Error')) {
+    class WP_Error {
+        public function __construct($code = '', $message = '', $data = '') {}
+    }
+}
+// Include the plugin file to be tested
+require_once dirname(__DIR__) . '/plugin-security-check.php';
