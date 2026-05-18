@@ -1,4 +1,7 @@
 {
+    "name": "shadabrcspl/plugin-security-check",
+    "description": "Security Check is an essential security tool for WordPress administrators who want to ensure the integrity of their website.",
+    "license": "GPL-2.0-only",
     "require-dev": {
         "phpunit/phpunit": "^9.5"
     }
