@@ -246,6 +246,79 @@ function plugin_approval_page() {
             echo '<div class="updated"><p>Security settings saved.</p></div>';
         }
 
+        // Handle running manual security tests
+        if (isset($_POST['run_security_tests'])) {
+            echo '<h3>Security Test Results</h3>';
+            echo '<div class="notice notice-info" style="padding: 10px;">';
+
+            // Test 1: User Enumeration
+            $response = wp_remote_get(home_url('/?author=1'), array('timeout' => 5));
+            if (!is_wp_error($response)) {
+                $code = wp_remote_retrieve_response_code($response);
+                $status = ($code == 301 || $code == 302 || $code == 404 || $code == 403) ? '<span style="color:green">Protected</span>' : '<span style="color:red">Vulnerable</span>';
+                echo "<p><strong>User Enumeration (?author=1):</strong> HTTP $code - $status</p>";
+            } else {
+                echo "<p><strong>User Enumeration (?author=1):</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
+            }
+
+            // Test 2: REST API Users Endpoint
+            $response = wp_remote_get(rest_url('wp/v2/users'), array('timeout' => 5));
+            if (!is_wp_error($response)) {
+                $code = wp_remote_retrieve_response_code($response);
+                $status = ($code == 401 || $code == 404 || $code == 403) ? '<span style="color:green">Protected</span>' : '<span style="color:red">Vulnerable</span>';
+                echo "<p><strong>REST API Users Endpoint:</strong> HTTP $code - $status</p>";
+            } else {
+                echo "<p><strong>REST API Users Endpoint:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
+            }
+
+            // Test 3: wp-config.php access
+            $response = wp_remote_get(home_url('/wp-config.php'), array('timeout' => 5));
+            if (!is_wp_error($response)) {
+                $code = wp_remote_retrieve_response_code($response);
+                $status = ($code == 403) ? '<span style="color:green">Protected (403 Forbidden)</span>' : '<span style="color:red">Vulnerable</span>';
+                echo "<p><strong>wp-config.php direct access:</strong> HTTP $code - $status</p>";
+            } else {
+                echo "<p><strong>wp-config.php direct access:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
+            }
+
+            // Test 4: XML-RPC
+            $response = wp_remote_post(home_url('/xmlrpc.php'), array(
+                'timeout' => 5,
+                'body' => '<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>'
+            ));
+            if (!is_wp_error($response)) {
+                $code = wp_remote_retrieve_response_code($response);
+                $body = wp_remote_retrieve_body($response);
+                $status = ($code == 403 || strpos($body, 'XML-RPC server accepts POST requests only') !== false || strpos($body, 'parse error') !== false) ? '<span style="color:green">Protected</span>' : '<span style="color:red">Vulnerable</span>';
+                echo "<p><strong>XML-RPC access:</strong> HTTP $code - $status</p>";
+            } else {
+                echo "<p><strong>XML-RPC access:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
+            }
+
+            // Test 5: Uploads PHP Execution
+            $upload_dir = wp_upload_dir();
+            $test_file_path = $upload_dir['basedir'] . '/test-execution.php';
+            $test_file_url = (isset($upload_dir['baseurl']) ? $upload_dir['baseurl'] : '') . '/test-execution.php';
+            file_put_contents($test_file_path, '<?php echo "executed"; ?>');
+
+            $response = wp_remote_get($test_file_url, array('timeout' => 5));
+            if (!is_wp_error($response)) {
+                $code = wp_remote_retrieve_response_code($response);
+                $body = wp_remote_retrieve_body($response);
+                $status = ($code == 403 || trim($body) !== 'executed') ? '<span style="color:green">Protected</span>' : '<span style="color:red">Vulnerable (File executed)</span>';
+                echo "<p><strong>Uploads Directory PHP Execution:</strong> HTTP $code - $status</p>";
+            } else {
+                echo "<p><strong>Uploads Directory PHP Execution:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
+            }
+
+            // Cleanup
+            if (file_exists($test_file_path)) {
+                unlink($test_file_path);
+            }
+
+            echo '</div>';
+        }
+
         $upload_dir = wp_upload_dir();
         $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
         $is_uploads_secure = file_exists($htaccess_file) && strpos(file_get_contents($htaccess_file), '<Files *.php>') !== false;
@@ -275,6 +348,12 @@ function plugin_approval_page() {
 
         echo '</table>';
         echo '<p class="submit"><input type="submit" name="save_security_settings" class="button button-primary" value="Save Settings"></p>';
+        echo '</form>';
+
+        echo '<hr>';
+        echo '<form method="post" action="">';
+        echo '<p class="submit"><input type="submit" name="run_security_tests" class="button button-secondary" value="Run Manual Security Tests"></p>';
+        echo '<p class="description">This will make loopback requests to your site to check if the protections are actively blocking access.</p>';
         echo '</form>';
     }
     echo '</div>'; // Close .wrap
