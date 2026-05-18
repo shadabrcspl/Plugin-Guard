@@ -277,6 +277,9 @@ function plugin_approval_page() {
                 $code = wp_remote_retrieve_response_code($response);
                 $status = ($code == 403) ? '<span style="color:green">Protected (403 Forbidden)</span>' : '<span style="color:red">Vulnerable</span>';
                 echo "<p><strong>wp-config.php direct access:</strong> HTTP $code - $status</p>";
+                if ($code != 403 && get_option('psc_protect_wpconfig', 'no') === 'yes') {
+                    echo "<p style=\"color:orange; margin-left: 20px; font-size: 12px;\"><em>Note: You enabled this setting, but the file is still accessible. If you are running NGINX, `.htaccess` files are ignored. You must manually add a rule to your nginx.conf to block access to wp-config.php.</em></p>";
+                }
             } else {
                 echo "<p><strong>wp-config.php direct access:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
             }
@@ -307,6 +310,11 @@ function plugin_approval_page() {
                 $body = wp_remote_retrieve_body($response);
                 $status = ($code == 403 || trim($body) !== 'executed') ? '<span style="color:green">Protected</span>' : '<span style="color:red">Vulnerable (File executed)</span>';
                 echo "<p><strong>Uploads Directory PHP Execution:</strong> HTTP $code - $status</p>";
+                $upload_dir_info = wp_upload_dir();
+                $htaccess_exists = file_exists($upload_dir_info['basedir'] . '/.htaccess') && strpos(file_get_contents($upload_dir_info['basedir'] . '/.htaccess'), '<Files *.php>') !== false;
+                if ($code != 403 && trim($body) === 'executed' && $htaccess_exists) {
+                    echo "<p style=\"color:orange; margin-left: 20px; font-size: 12px;\"><em>Note: The security setting is enabled, but the file still executed. If you are running NGINX, `.htaccess` files are ignored. You must manually add a rule to your nginx.conf to disable PHP execution in wp-content/uploads/.</em></p>";
+                }
             } else {
                 echo "<p><strong>Uploads Directory PHP Execution:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
             }
@@ -451,7 +459,7 @@ function secure_uploads_directory() {
     $upload_dir = wp_upload_dir();
     $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
 
-    $rules = "<Files *.php>\nDeny from all\n</Files>";
+    $rules = "<Files *.php>\n<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n</Files>";
 
     if (!file_exists($htaccess_file)) {
         file_put_contents($htaccess_file, $rules);
@@ -471,11 +479,11 @@ function remove_secure_uploads_directory() {
 
     if (file_exists($htaccess_file)) {
         $content = file_get_contents($htaccess_file);
-        $rules = "<Files *.php>\nDeny from all\n</Files>\n";
+        $rules = "<Files *.php>\n<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n</Files>\n";
         $new_content = str_replace($rules, '', $content);
 
         // Also check if it was added without a trailing newline
-        $rules_no_newline = "<Files *.php>\nDeny from all\n</Files>";
+        $rules_no_newline = "<Files *.php>\n<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n</Files>";
         $new_content = str_replace($rules_no_newline, '', $new_content);
 
         // If the file is now empty or just whitespace, delete it
@@ -535,8 +543,13 @@ function psc_update_root_htaccess() {
 
         if (get_option('psc_protect_wpconfig', 'no') === 'yes') {
             $rules[] = '<Files wp-config.php>';
-            $rules[] = 'order allow,deny';
-            $rules[] = 'deny from all';
+            $rules[] = '<IfModule mod_authz_core.c>';
+            $rules[] = '    Require all denied';
+            $rules[] = '</IfModule>';
+            $rules[] = '<IfModule !mod_authz_core.c>';
+            $rules[] = '    Order deny,allow';
+            $rules[] = '    Deny from all';
+            $rules[] = '</IfModule>';
             $rules[] = '</Files>';
         }
 
