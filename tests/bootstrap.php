@@ -53,5 +53,69 @@ if (!function_exists('wp_upload_dir')) {
         return ['basedir' => sys_get_temp_dir() . '/wp-content/uploads'];
     }
 }
+if (!function_exists('insert_with_markers')) {
+    function insert_with_markers($filename, $marker, $insertion) {
+        return true;
+    }
+}
+if (!function_exists('get_home_path')) {
+    function get_home_path() {
+        return sys_get_temp_dir() . '/';
+    }
+}
+if (!function_exists('is_author')) {
+    function is_author() {
+        return false;
+    }
+}
+if (!function_exists('wp_redirect')) {
+    function wp_redirect($location, $status = 302, $x_redirect_by = 'WordPress') {}
+}
+if (!function_exists('home_url')) {
+    function home_url($path = '', $scheme = null) {
+        return 'http://example.com' . $path;
+    }
+}
+if (!function_exists('add_menu_page')) {
+    function add_menu_page() {}
+}
+if (!function_exists('sanitize_text_field')) {
+    function sanitize_text_field($str) {
+        return strip_tags(trim($str));
+    }
+}
+if (!function_exists('wp_die')) {
+    function wp_die($message = '', $title = '', $args = array()) {
+        die($message);
+    }
+}
+if (!function_exists('current_user_can')) {
+    function current_user_can($capability, ...$args) {
+        return true;
+    }
+}
+if (!function_exists('esc_html')) {
+    function esc_html($text) {
+        return htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
+    }
+}
+if (!function_exists('esc_attr')) {
+    function esc_attr($text) {
+        return htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
+    }
+}
+
 // Include the plugin file to be tested
 require_once dirname(__DIR__) . '/plugin-security-check.php';
+if (!function_exists('checked')) {
+    function checked($checked, $current = true, $echo = true) {
+        $result = '';
+        if ((string)$checked === (string)$current) {
+            $result = " checked='checked'";
+        }
+        if ($echo) {
+            echo $result;
+        }
+        return $result;
+    }
+}

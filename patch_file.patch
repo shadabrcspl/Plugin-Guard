@@ -1,0 +1,114 @@
+--- plugin-security-check.php
++++ plugin-security-check.php
+@@ -155,6 +155,14 @@
+
+ // Callback for plugin approval admin page
+ function plugin_approval_page() {
++    // Tab navigation
++    $active_tab = isset($_GET['tab']) ? sanitize_text_field($_GET['tab']) : 'approvals';
++
++    echo '<div class="wrap">';
++    echo '<h1>Plugin Security Check Settings</h1>';
++    echo '<h2 class="nav-tab-wrapper">';
++    echo '<a href="?page=plugin-approvals&tab=approvals" class="nav-tab ' . ($active_tab == 'approvals' ? 'nav-tab-active' : '') . '">Plugin Approvals</a>';
++    echo '<a href="?page=plugin-approvals&tab=security" class="nav-tab ' . ($active_tab == 'security' ? 'nav-tab-active' : '') . '">Security Settings</a>';
++    echo '</h2>';
++
++    if ($active_tab == 'approvals') {
+     // Handle plugin approval
+     if (isset($_POST['approve_plugin'])) {
+         $plugin_slug = sanitize_text_field($_POST['plugin_slug']);
+@@ -174,23 +182,6 @@
+         echo '<div class="updated"><p>All pending approval plugins have been removed!</p></div>';
+     }
+
+-    // Handle toggling PHP execution in uploads directory
+-    if (isset($_POST['toggle_php_execution'])) {
+-        $upload_dir = wp_upload_dir();
+-        $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
+-        $is_secure = false;
+-        if (file_exists($htaccess_file) && strpos(file_get_contents($htaccess_file), '<Files *.php>') !== false) {
+-            $is_secure = true;
+-        }
+-        if ($is_secure) {
+-            remove_secure_uploads_directory();
+-            echo '<div class="updated"><p>PHP execution in uploads directory has been ENABLED.</p></div>';
+-        } else {
+-            secure_uploads_directory();
+-            echo '<div class="updated"><p>PHP execution in uploads directory has been DISABLED.</p></div>';
+-        }
+-    }
+-
+     // Retrieve the list of pending plugins
+     $pending_approval_plugins = get_option('pending_approval_plugins', array());
+
+@@ -226,22 +217,66 @@
+     echo '<input type="submit" name="clear_pending_plugins" value="Clear All Pending Plugins" class="button-primary">';
+     echo '</form>';
++    } elseif ($active_tab == 'security') {
++        // Handle saving security settings
++        if (isset($_POST['save_security_settings'])) {
++            update_option('psc_disable_xmlrpc', isset($_POST['psc_disable_xmlrpc']) ? 'yes' : 'no');
++            update_option('psc_prevent_enumeration', isset($_POST['psc_prevent_enumeration']) ? 'yes' : 'no');
++            update_option('psc_disable_directory_browsing', isset($_POST['psc_disable_directory_browsing']) ? 'yes' : 'no');
++            update_option('psc_protect_wpconfig', isset($_POST['psc_protect_wpconfig']) ? 'yes' : 'no');
++
++            // Update root .htaccess based on new settings
++            psc_update_root_htaccess();
++
++            // Handle toggling PHP execution in uploads directory
++            $upload_dir = wp_upload_dir();
++            $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
++            if (isset($_POST['psc_secure_uploads'])) {
++                secure_uploads_directory();
++            } else {
++                remove_secure_uploads_directory();
++            }
++
++            echo '<div class="updated"><p>Security settings saved.</p></div>';
++        }
+
+-    // PHP Execution Toggle
+-    echo '<h2>Uploads Directory Security</h2>';
+-    $upload_dir = wp_upload_dir();
+-    $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
+-    $is_secure = false;
+-    if (file_exists($htaccess_file) && strpos(file_get_contents($htaccess_file), '<Files *.php>') !== false) {
+-        $is_secure = true;
+-    }
+-    $status_text = $is_secure ? '<strong style="color:green;">DISABLED (Secure)</strong>' : '<strong style="color:red;">ENABLED (Vulnerable)</strong>';
+-    $button_text = $is_secure ? 'Enable PHP Execution in Uploads' : 'Disable PHP Execution in Uploads';
+-
+-    echo '<p>Current PHP execution status in uploads directory: ' . $status_text . '</p>';
+-    echo '<form method="post" action="" style="margin-top: 10px;">';
+-    echo '<input type="submit" name="toggle_php_execution" value="' . esc_attr($button_text) . '" class="button-secondary">';
+-    echo '</form>';
++        $upload_dir = wp_upload_dir();
++        $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
++        $is_uploads_secure = file_exists($htaccess_file) && strpos(file_get_contents($htaccess_file), '<Files *.php>') !== false;
++
++        echo '<form method="post" action="">';
++        echo '<table class="form-table">';
++        echo '<tr><th scope="row">Secure Uploads Directory</th>';
++        echo '<td><label><input type="checkbox" name="psc_secure_uploads" value="1" ' . checked($is_uploads_secure, true, false) . '> Disable PHP execution in the uploads directory</label></td></tr>';
++
++        echo '<tr><th scope="row">Disable XML-RPC</th>';
++        echo '<td><label><input type="checkbox" name="psc_disable_xmlrpc" value="1" ' . checked(get_option('psc_disable_xmlrpc', 'no'), 'yes', false) . '> Disable XML-RPC to prevent pingback and brute-force attacks</label></td></tr>';
++
++        echo '<tr><th scope="row">Prevent User Enumeration</th>';
++        echo '<td><label><input type="checkbox" name="psc_prevent_enumeration" value="1" ' . checked(get_option('psc_prevent_enumeration', 'no'), 'yes', false) . '> Block author scans and REST API user endpoint access</label></td></tr>';
++
++        echo '<tr><th scope="row">Disable Directory Browsing</th>';
++        echo '<td><label><input type="checkbox" name="psc_disable_directory_browsing" value="1" ' . checked(get_option('psc_disable_directory_browsing', 'no'), 'yes', false) . '> Prevent attackers from seeing a list of files in directories without an index file</label></td></tr>';
++
++        echo '<tr><th scope="row">Protect wp-config.php</th>';
++        echo '<td><label><input type="checkbox" name="psc_protect_wpconfig" value="1" ' . checked(get_option('psc_protect_wpconfig', 'no'), 'yes', false) . '> Block web access to wp-config.php</label></td></tr>';
++
++        echo '</table>';
++        echo '<p class="submit"><input type="submit" name="save_security_settings" class="button button-primary" value="Save Settings"></p>';
++        echo '</form>';
++    }
++    echo '</div>'; // Close .wrap
+ }
+
+ // Approve plugin function
