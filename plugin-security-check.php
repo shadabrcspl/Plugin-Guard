@@ -327,6 +327,26 @@ function plugin_approval_page() {
                 unlink($test_file_path);
             }
 
+            // Test 6: Disable Plugin/Theme Installation
+            $file_mods_disabled = (defined('DISALLOW_FILE_MODS') && DISALLOW_FILE_MODS === true);
+            $status = $file_mods_disabled ? '<span style="color:green">Protected (Disabled)</span>' : '<span style="color:red">Vulnerable (Enabled)</span>';
+            echo "<p><strong>Plugin/Theme Installation:</strong> $status</p>";
+
+            // Test 7: Hide WordPress Version
+            $response = wp_remote_get(home_url('/'), array('timeout' => 5));
+            if (!is_wp_error($response)) {
+                $body = wp_remote_retrieve_body($response);
+                $has_generator = (strpos($body, '<meta name="generator" content="WordPress') !== false);
+                // A simplistic check to see if scripts/styles have the default WP version appended
+                global $wp_version;
+                $has_version_args = (strpos($body, '?ver=' . $wp_version) !== false);
+
+                $status = (!$has_generator && !$has_version_args) ? '<span style="color:green">Protected (Hidden)</span>' : '<span style="color:red">Vulnerable (Visible)</span>';
+                echo "<p><strong>WordPress Version Visibility:</strong> $status</p>";
+            } else {
+                echo "<p><strong>WordPress Version Visibility:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
+            }
+
             echo '</div>';
         }
 
@@ -905,6 +925,18 @@ function psc_run_database_checks() {
     } else {
         echo '<p style="color:green;"><strong>Protected:</strong> Your database prefix is not the default. Good job!</p>';
     }
+
+    $suspicious_options = psc_get_suspicious_db_options();
+    if (!empty($suspicious_options)) {
+        echo '<h4 style="color:red; margin-top: 15px;">Suspicious Database Options Found:</h4><ul>';
+        foreach ($suspicious_options as $opt_name) {
+            echo '<li><code>' . esc_html($opt_name) . '</code> (Potential malicious payload detected)</li>';
+        }
+        echo '</ul><p>Please review these options in your database via phpMyAdmin or a database manager plugin.</p>';
+    } else {
+        echo '<p style="color:green;"><strong>Clean:</strong> No suspicious payloads detected in the database options table.</p>';
+    }
+
     echo '</div>';
 }
 
@@ -1034,12 +1066,11 @@ function psc_scheduled_advanced_scan() {
     }
 
     // Check 3: Suspicious DB Options
-    global $wpdb;
-    $suspicious_options = $wpdb->get_results("SELECT option_name, option_value FROM $wpdb->options WHERE option_name LIKE '%_transient_%' OR option_name LIKE '%_site_transient_%' AND (option_value LIKE '%eval(%' OR option_value LIKE '%base64_decode(%') LIMIT 10");
+    $suspicious_options = psc_get_suspicious_db_options();
     if (!empty($suspicious_options)) {
         $alerts[] = "Suspicious Database Options Detected (Potential Malicious Payloads):";
-        foreach ($suspicious_options as $opt) {
-            $alerts[] = "- " . $opt->option_name;
+        foreach ($suspicious_options as $opt_name) {
+            $alerts[] = "- " . $opt_name;
         }
     }
 
@@ -1093,4 +1124,74 @@ function psc_update_baselines_on_upgrade($upgrader_object, $options) {
     } elseif ($options['type'] === 'theme') {
         update_option('psc_themes_baseline_hash', psc_generate_directory_hash(get_theme_root()));
     }
+}
+
+
+// Helper to fetch genuinely suspicious database options
+function psc_get_suspicious_db_options() {
+    global $wpdb;
+
+    // Whitelist common safe prefixes to reduce processing
+    $whitelist_prefixes = array('_transient_timeout_', '_site_transient_timeout_');
+
+    // Broad SQL query to grab potentially risky options (we will filter in PHP)
+    // We target transients, site transients, and other options that might hold serialized payloads
+    $query = "SELECT option_name, option_value FROM {$wpdb->options} WHERE
+             option_value LIKE '%eval(%' OR
+             option_value LIKE '%base64_decode%' OR
+             option_value LIKE '%gzinflate%' OR
+             option_value LIKE '%system(%' OR
+             option_value LIKE '%exec(%' OR
+             option_value LIKE '%shell_exec(%' OR
+             option_value LIKE '%passthru(%' OR
+             LENGTH(option_value) > 10000"; // Flag unusually large options for heuristic check
+
+    $results = $wpdb->get_results($query);
+    $suspicious = array();
+
+    if (empty($results)) return $suspicious;
+
+    $malware_patterns = array(
+        '/eval\s*\(\s*base64_decode/i',
+        '/eval\s*\(\s*\$_(POST|GET|REQUEST|COOKIE)/i',
+        '/gzinflate\s*\(\s*base64_decode/i',
+        '/system\s*\(\s*\$_(POST|GET)/i',
+        '/exec\s*\(\s*\$_(POST|GET)/i',
+        '/passthru\s*\(\s*\$_(POST|GET)/i',
+        '/shell_exec\s*\(/i',
+        '/(?:[a-zA-Z0-9+\/]{4}){100,}(?:[a-zA-Z0-9+\/]{2}==|[a-zA-Z0-9+\/]{3}=)?/' // Very long base64 strings
+    );
+
+    foreach ($results as $row) {
+        $name = $row->option_name;
+        $val = $row->option_value;
+
+        // Skip explicitly whitelisted prefixes
+        $skip = false;
+        foreach ($whitelist_prefixes as $prefix) {
+            if (strpos($name, $prefix) === 0) {
+                $skip = true;
+                break;
+            }
+        }
+        if ($skip) continue;
+
+        // If it's a known transient but its value isn't serialized or JSON, it might be a payload
+        $is_transient = (strpos($name, '_transient_') === 0 || strpos($name, '_site_transient_') === 0);
+
+        // Apply strict heuristics
+        $is_malicious = false;
+        foreach ($malware_patterns as $pattern) {
+            if (preg_match($pattern, $val)) {
+                $is_malicious = true;
+                break;
+            }
+        }
+
+        if ($is_malicious) {
+            $suspicious[] = $name;
+        }
+    }
+
+    return $suspicious;
 }
