@@ -175,6 +175,23 @@ function plugin_approval_page() {
         echo '<div class="updated"><p>All pending approval plugins have been removed!</p></div>';
     }
 
+    // Handle toggling PHP execution in uploads directory
+    if (isset($_POST['toggle_php_execution'])) {
+        $upload_dir = wp_upload_dir();
+        $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
+        $is_secure = false;
+        if (file_exists($htaccess_file) && strpos(file_get_contents($htaccess_file), '<Files *.php>') !== false) {
+            $is_secure = true;
+        }
+        if ($is_secure) {
+            remove_secure_uploads_directory();
+            echo '<div class="updated"><p>PHP execution in uploads directory has been ENABLED.</p></div>';
+        } else {
+            secure_uploads_directory();
+            echo '<div class="updated"><p>PHP execution in uploads directory has been DISABLED.</p></div>';
+        }
+    }
+
     // Retrieve the list of pending plugins
     $pending_approval_plugins = get_option('pending_approval_plugins', array());
 
@@ -207,6 +224,22 @@ function plugin_approval_page() {
     // Clear all pending plugins form
     echo '<form method="post" action="" style="margin-top: 20px;">';
     echo '<input type="submit" name="clear_pending_plugins" value="Clear All Pending Plugins" class="button-primary">';
+    echo '</form>';
+
+    // PHP Execution Toggle
+    echo '<h2>Uploads Directory Security</h2>';
+    $upload_dir = wp_upload_dir();
+    $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
+    $is_secure = false;
+    if (file_exists($htaccess_file) && strpos(file_get_contents($htaccess_file), '<Files *.php>') !== false) {
+        $is_secure = true;
+    }
+    $status_text = $is_secure ? '<strong style="color:green;">DISABLED (Secure)</strong>' : '<strong style="color:red;">ENABLED (Vulnerable)</strong>';
+    $button_text = $is_secure ? 'Enable PHP Execution in Uploads' : 'Disable PHP Execution in Uploads';
+
+    echo '<p>Current PHP execution status in uploads directory: ' . $status_text . '</p>';
+    echo '<form method="post" action="" style="margin-top: 10px;">';
+    echo '<input type="submit" name="toggle_php_execution" value="' . esc_attr($button_text) . '" class="button-secondary">';
     echo '</form>';
 }
 
