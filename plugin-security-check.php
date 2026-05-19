@@ -167,22 +167,31 @@ function plugin_approval_page() {
     echo '</h2>';
 
     if ($active_tab == 'approvals') {
+    // Verify nonce for approval actions
+    $nonce_valid = isset($_POST['psc_approvals_nonce']) && wp_verify_nonce($_POST['psc_approvals_nonce'], 'psc_approvals_action');
+
     // Handle plugin approval
-    if (isset($_POST['approve_plugin'])) {
+    if (isset($_POST['approve_plugin']) && $nonce_valid) {
         $plugin_slug = sanitize_text_field($_POST['plugin_slug']);
-        approve_plugin($plugin_slug);
-        echo '<div class="updated"><p>Plugin approved and activated!</p></div>';
+        $pending = get_option('pending_approval_plugins', array());
+        if (in_array($plugin_slug, $pending)) {
+            approve_plugin($plugin_slug);
+            echo '<div class="updated"><p>Plugin approved and activated!</p></div>';
+        }
     }
 
     // Handle plugin rejection
-    if (isset($_POST['reject_plugin'])) {
+    if (isset($_POST['reject_plugin']) && $nonce_valid) {
         $plugin_slug = sanitize_text_field($_POST['plugin_slug']);
-        reject_plugin($plugin_slug);
-        echo '<div class="updated"><p>Plugin rejected and deleted!</p></div>';
+        $pending = get_option('pending_approval_plugins', array());
+        if (in_array($plugin_slug, $pending)) {
+            reject_plugin($plugin_slug);
+            echo '<div class="updated"><p>Plugin rejected and deleted!</p></div>';
+        }
     }
 
     // Handle clearing all pending approval plugins
-    if (isset($_POST['clear_pending_plugins'])) {
+    if (isset($_POST['clear_pending_plugins']) && $nonce_valid) {
         clear_pending_plugins();
         echo '<div class="updated"><p>All pending approval plugins have been removed!</p></div>';
     }
@@ -202,11 +211,13 @@ function plugin_approval_page() {
 
             // Approval and rejection forms
             echo ' <form method="post" action="" style="display:inline;">';
+            wp_nonce_field('psc_approvals_action', 'psc_approvals_nonce');
             echo '<input type="hidden" name="plugin_slug" value="' . esc_attr($plugin) . '">';
             echo '<input type="submit" name="approve_plugin" value="Approve" style="margin-right:10px;">';
             echo '</form>';
 
             echo ' <form method="post" action="" style="display:inline;">';
+            wp_nonce_field('psc_approvals_action', 'psc_approvals_nonce');
             echo '<input type="hidden" name="plugin_slug" value="' . esc_attr($plugin) . '">';
             echo '<input type="submit" name="reject_plugin" value="Reject">';
             echo '</form>';
@@ -219,12 +230,14 @@ function plugin_approval_page() {
 
     // Clear all pending plugins form
     echo '<form method="post" action="" style="margin-top: 20px;">';
+    wp_nonce_field('psc_approvals_action', 'psc_approvals_nonce');
     echo '<input type="submit" name="clear_pending_plugins" value="Clear All Pending Plugins" class="button-primary">';
     echo '</form>';
 
     } elseif ($active_tab == 'security') {
+        $security_nonce_valid = isset($_POST['psc_security_nonce']) && wp_verify_nonce($_POST['psc_security_nonce'], 'psc_security_action');
         // Handle saving security settings
-        if (isset($_POST['save_security_settings'])) {
+        if (isset($_POST['save_security_settings']) && $security_nonce_valid) {
             update_option('psc_disable_xmlrpc', isset($_POST['psc_disable_xmlrpc']) ? 'yes' : 'no');
             update_option('psc_prevent_enumeration', isset($_POST['psc_prevent_enumeration']) ? 'yes' : 'no');
             update_option('psc_disable_directory_browsing', isset($_POST['psc_disable_directory_browsing']) ? 'yes' : 'no');
@@ -250,7 +263,7 @@ function plugin_approval_page() {
         }
 
         // Handle running manual security tests
-        if (isset($_POST['run_security_tests'])) {
+        if (isset($_POST['run_security_tests']) && $security_nonce_valid) {
             echo '<h3>Security Test Results</h3>';
             echo '<div class="notice notice-info" style="padding: 10px;">';
 
@@ -355,6 +368,7 @@ function plugin_approval_page() {
         $is_uploads_secure = file_exists($htaccess_file) && strpos(file_get_contents($htaccess_file), '<Files *.php>') !== false;
 
         echo '<form method="post" action="">';
+        wp_nonce_field('psc_security_action', 'psc_security_nonce');
         echo '<table class="form-table">';
         echo '<tr><th scope="row">Secure Uploads Directory</th>';
         echo '<td><label><input type="checkbox" name="psc_secure_uploads" value="1" ' . checked($is_uploads_secure, true, false) . '> Disable PHP execution in the uploads directory</label></td></tr>';
@@ -389,13 +403,14 @@ function plugin_approval_page() {
 
         echo '<hr>';
         echo '<form method="post" action="">';
+        wp_nonce_field('psc_security_action', 'psc_security_nonce');
         echo '<p class="submit"><input type="submit" name="run_security_tests" class="button button-secondary" value="Run Manual Security Tests"></p>';
         echo '<p class="description">This will make loopback requests to your site to check if the protections are actively blocking access.</p>';
         echo '</form>';
 
         // NGINX Rules Section
         $is_nginx = (strpos($_SERVER['SERVER_SOFTWARE'] ?? '', 'nginx') !== false);
-        if ($is_nginx || isset($_POST['show_nginx_rules'])) {
+        if ($is_nginx || (isset($_POST['show_nginx_rules']) && $security_nonce_valid)) {
             echo '<hr>';
             echo '<h3>NGINX Server Configuration</h3>';
             echo '<p>It appears you are running NGINX (or requested NGINX rules). NGINX ignores `.htaccess` files. For the <strong>Secure Uploads Directory</strong> and <strong>Protect wp-config.php</strong> settings to work, you must manually add the following rules to your server configuration block (usually located in <code>/etc/nginx/sites-available/</code>) inside the <code>server { ... }</code> block:</p>';
@@ -419,6 +434,7 @@ function plugin_approval_page() {
         } elseif (!$is_nginx) {
             echo '<hr>';
             echo '<form method="post" action="">';
+            wp_nonce_field('psc_security_action', 'psc_security_nonce');
             echo '<p class="submit"><input type="submit" name="show_nginx_rules" class="button button-secondary" value="Show NGINX Rules"></p>';
             echo '</form>';
         }
@@ -1175,9 +1191,6 @@ function psc_get_suspicious_db_options() {
             }
         }
         if ($skip) continue;
-
-        // If it's a known transient but its value isn't serialized or JSON, it might be a payload
-        $is_transient = (strpos($name, '_transient_') === 0 || strpos($name, '_site_transient_') === 0);
 
         // Apply strict heuristics
         $is_malicious = false;
