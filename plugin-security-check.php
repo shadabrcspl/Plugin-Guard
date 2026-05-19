@@ -960,12 +960,13 @@ function psc_run_malware_scan($silent = false) {
     $upload_dir = wp_upload_dir();
     $scan_dirs = array(WP_PLUGIN_DIR, get_theme_root(), $upload_dir['basedir']);
 
+    // Break up the strings so this file doesn't flag itself during the scan
     $suspicious_patterns = array(
-        'eval(base64_decode',
-        'eval($_POST',
-        'eval($_GET',
-        'str_rot13',
-        'gzinflate(base64_decode'
+        'eval' . '(base64' . '_decode',
+        'eval' . '($_POST',
+        'eval' . '($_GET',
+        'str' . '_rot13',
+        'gzinflate' . '(base64' . '_decode'
     );
 
     $found_issues = array();
@@ -977,6 +978,10 @@ function psc_run_malware_scan($silent = false) {
         foreach ($iterator as $file) {
             if ($file->isDir()) continue;
             if (pathinfo($file->getFilename(), PATHINFO_EXTENSION) !== 'php') continue;
+
+            // Ignore common vendor/dependency directories which often contain these strings legitimately (e.g. polyfills, test mocks)
+            $path = $file->getPathname();
+            if (strpos($path, '/vendor/') !== false || strpos($path, '/node_modules/') !== false) continue;
 
             $contents = @file_get_contents($file->getPathname());
             if (!$contents) continue;
