@@ -176,7 +176,13 @@ if (!class_exists('WP_User')) {
 if (!function_exists('update_user_meta')) {
     function update_user_meta($user_id, $meta_key, $meta_value, $prev_value = '') { return true; }
 }
+if (!class_exists('Mock_WPDB')) {
+    class Mock_WPDB {
+        public $options = 'wp_options';
+        public function get_results($query) {
+            return array();
+        }
+    }
+}
 global $wpdb;
-$wpdb = new stdClass();
-$wpdb->options = 'wp_options';
-$wpdb->get_results = function($query) { return array(); };
+$wpdb = new Mock_WPDB();
