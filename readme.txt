@@ -1,60 +1,71 @@
-=== Plugin Guard ===
-Contributors: shadabcse2020
-Tags: security, admin, plugins management, email notifications
-Short Description: A powerful plugin that ensures only authorized plugins are active on your WordPress site, preventing unauthorized access and enhancing security.
+=== Plugin Security Check ===
+Contributors: shadabrcspl
+Tags: security, malware scanner, firewall, login protection, hardening
 Requires at least: 5.0
-Tested up to: 6.6
+Tested up to: 6.4
+Requires PHP: 7.2
 Stable tag: 1.2
 License: GPLv2 or later
-License URI: http://www.gnu.org/licenses/gpl-2.0.html
+License URI: https://www.gnu.org/licenses/gpl-2.0.html
+
+An essential, all-in-one security suite to protect your WordPress installation from unauthorized plugins, malware, brute force attacks, and core file modifications.
+
 == Description ==
-Security Check is an essential security tool for WordPress administrators who want to ensure the integrity of their website. This plugin actively monitors the installation of new plugins and prevents unauthorized plugins from being activated without administrative approval. 
 
-### Key Features
-- Automatic Deactivation of Unauthorized Plugins**: If a new plugin is installed that is not on your approved list, the plugin will automatically deactivate it to protect your site.
-  
-- Pending Approval System: Any new plugins that require approval will be sent to a pending status. Administrators will receive an email notification detailing the newly installed plugin, including its name and description.
-  
-- Email Notifications: Administrators will receive an email whenever a new plugin is installed, allowing for quick responses and decisions on whether to approve or not the plugin.
-  
-- Easy Approval Process: Administrators can easily approve plugins through the WordPress dashboard, allowing for safe and controlled plugin management.
+Plugin Security Check (Plugin Guard) is an advanced security tool designed to give WordPress administrators complete control over their site's integrity. It actively monitors for hacks, blocks unauthorized actions, and provides a powerful suite of hardening tools to keep your site safe.
 
-- User-Friendly Interface: The plugin integrates seamlessly into the WordPress admin area, providing an intuitive interface for managing pending plugin approvals.
+= Key Features =
 
-### Installation
+*   **Unauthorized Plugin Protection:** Automatically blocks any unapproved plugins from being activated or installed. Requires an admin to manually review and approve new plugins.
+*   **Core Integrity Scanner:** Scans your WordPress core files against the official WordPress.org checksums to detect malicious backdoors or modifications. Includes a one-click "Repair Core Files" feature to seamlessly reinstall a clean version of WordPress if compromised.
+*   **Malware & DB Scanner:** Heuristically scans `wp-content` directories (plugins, themes, uploads) for suspicious PHP payloads (e.g., `eval`, `base64`). Scans your database for injected payloads and warns if your database prefix is vulnerable.
+*   **Advanced Monitoring:** Automatically creates baselines of your plugin and theme directories. Warns you if files are modified outside of standard upgrades. Detects suspicious scheduled cron jobs.
+*   **Rogue Admin Defense:** Maintains a secure list of known administrators. Automatically locks and demotes any unknown admin accounts created via exploits.
+*   **Uploads Directory Protection:** Blocks PHP execution in the `wp-content/uploads/` directory to neutralize uploaded web shells. Automatically handles `.htaccess` generation (with NGINX instructions provided).
+*   **WordPress Hardening:**
+    *   Disable the built-in Theme and Plugin editors (`DISALLOW_FILE_EDIT`).
+    *   Disable Plugin/Theme installations (`DISALLOW_FILE_MODS`).
+    *   Hide the WordPress version number from page source and asset URLs.
+    *   Disable Application Passwords.
+    *   Disable XML-RPC to block brute-force and DDoS attacks.
+    *   Restrict the entire REST API to authenticated users.
+    *   Block User Enumeration via `?author=1` and REST API endpoints.
+    *   Disable Directory Browsing.
+    *   Protect `wp-config.php` from direct web access.
+*   **Email Alerts:** Receive immediate notifications for new admin users, privilege escalations, theme changes, new plugin installations, and daily malware scan results.
+*   **Live Testing Tool:** An integrated loopback testing tool allows you to manually verify that your security settings (like blocking `wp-config.php` or `xmlrpc.php`) are actively working on your live server.
+
+== Installation ==
+
 1. Upload the plugin files to the `/wp-content/plugins/plugin-security-check` directory, or install the plugin through the WordPress plugins screen directly.
 2. Activate the plugin through the 'Plugins' screen in WordPress.
-3. Configure the settings as needed by navigating to **Settings > Plugin Security Check** in the WordPress dashboard.
+3. Navigate to the new 'Plugin Approvals' menu in the WordPress admin dashboard to configure your security settings.
 
-### How It Works
-Upon activation, the plugin stores the currently active plugins in the WordPress options table. Any new plugin installed will trigger an email notification to the admin. The admin can review the details of the new plugin in the "Pending Plugin Approvals" section of the dashboard. The admin must approve the plugin for it to be activated; otherwise, it remains deactivated.
+== Frequently Asked Questions ==
 
-### Frequently Asked Questions
-= How does the plugin handle unauthorized plugins? =
-The plugin will deactivate any newly installed plugin that is not in the allowed list and notify the admin via email.
+= I'm locked out or a plugin won't activate! =
+Go to the "Plugin Approvals" tab in the admin menu. You will see a list of plugins pending approval. Click "Approve" to whitelist and activate them.
 
-= Can I customize the list of allowed plugins? =
-No, you can't modify the allowed plugins list directly in the plugin's settings.
+= My server runs NGINX. Will the Uploads protection work? =
+NGINX ignores `.htaccess` files. The plugin will detect this and provide you with the exact NGINX configuration block you need to copy into your server's `nginx.conf` file to ensure protection.
 
-= What happens if I want to use a new plugin? =
-Simply install the plugin, and it will be sent to the admin for approval. Once you approved from dashboard, It will be activated.
-
-= Where can I find more support? =
-You can find additional support on the [Codxpert Support Forum](https://github.com/shadabrcspl/Plugin-Guard).
+= Does this slow down my website? =
+No. The core protections rely on lightweight WordPress hooks and server-level rules (`.htaccess`). The heavier scans (Malware and Baseline checks) are scheduled efficiently via WP-Cron to run once daily in the background.
 
 == Changelog ==
 
 = 1.2 =
-* Added **Clear All Pending Plugins** feature for easy management of pending plugins.
-* Added the ability to Reject Plugins, which will deactivate and delete the plugin.
-* Updated email notifications to only notify once for each new plugin.
+* Added Core Integrity Scanner and Repair tool.
+* Added Database payload scanner.
+* Added CSRF protection to all administrative actions.
+* Added advanced monitoring for cron jobs and rogue admin accounts.
+* Added live loopback testing tool.
+* Refactored settings into a tabbed dashboard.
 
-= 1.1
-* Fixed issue where the plugin was requiring its own approval.
-* Excluded "Security Check" from deactivation and pending approval logic.
-* Updated version in code to reflect the latest improvements.
+= 1.1 =
+* Added `.htaccess` protections for uploads directory, directory browsing, and `wp-config.php`.
+* Added options to disable XML-RPC, REST API, Application Passwords, and File Editors.
+* Fixed self-identification bug preventing the plugin from activating.
 
 = 1.0 =
-* Initial release of Security Check.
-* Automatically deactivates unauthorized plugins.
-* Sends an email notification to admin for plugin approval.
+* Initial release. Basic plugin approval queue.
