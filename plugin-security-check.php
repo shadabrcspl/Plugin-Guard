@@ -246,6 +246,7 @@ function plugin_approval_page() {
             update_option('psc_restrict_rest_api', isset($_POST['psc_restrict_rest_api']) ? 'yes' : 'no');
             update_option('psc_disallow_file_mods', isset($_POST['psc_disallow_file_mods']) ? 'yes' : 'no');
             update_option('psc_hide_wp_version', isset($_POST['psc_hide_wp_version']) ? 'yes' : 'no');
+            update_option('psc_require_post_approval', isset($_POST['psc_require_post_approval']) ? 'yes' : 'no');
 
             // Update root .htaccess based on new settings
             psc_update_root_htaccess();
@@ -396,6 +397,9 @@ function plugin_approval_page() {
 
         echo '<tr><th scope="row">Hide WordPress Version</th>';
         echo '<td><label><input type="checkbox" name="psc_hide_wp_version" value="1" ' . checked(get_option('psc_hide_wp_version', 'no'), 'yes', false) . '> Remove WP version from meta tags and script/style URLs</label></td></tr>';
+
+        echo '<tr><th scope="row">Require Post Approval</th>';
+        echo '<td><label><input type="checkbox" name="psc_require_post_approval" value="1" ' . checked(get_option('psc_require_post_approval', 'no'), 'yes', false) . '> Require admin approval before non-admins can publish blog posts</label></td></tr>';
 
         echo '</table>';
         echo '<p class="submit"><input type="submit" name="save_security_settings" class="button button-primary" value="Save Settings"></p>';
@@ -1262,4 +1266,71 @@ function psc_get_suspicious_db_options() {
     }
 
     return $suspicious;
+}
+
+// --- Content Approval System ---
+
+// Intercept post publishing for non-admins
+if (get_option('psc_require_post_approval', 'no') === 'yes') {
+    add_filter('wp_insert_post_data', 'psc_require_admin_approval_for_posts', 10, 2);
+}
+
+function psc_require_admin_approval_for_posts($data, $postarr) {
+    // We only care about standard posts (blogs)
+    if ($data['post_type'] !== 'post') {
+        return $data;
+    }
+
+    // If the user is trying to publish or schedule the post
+    if (in_array($data['post_status'], array('publish', 'future'))) {
+
+        // Bypass the check if this is an automated WP-Cron job (e.g., publishing a previously scheduled post by an admin)
+        if (defined('DOING_CRON') && DOING_CRON) {
+            return $data;
+        }
+
+        if (function_exists('wp_get_current_user')) {
+            $user = wp_get_current_user();
+
+            // If user is not logged in (e.g. REST API exploit) or is not an administrator
+            if (!$user->exists() || !in_array('administrator', (array) $user->roles)) {
+
+                // Force the post back to pending review
+                $data['post_status'] = 'pending';
+
+                // Note: We don't send the email here because this filter runs multiple times
+                // We use transition_post_status for the email alert.
+            }
+        }
+    }
+
+    return $data;
+}
+
+// Alert admin when a post requires approval
+if (get_option('psc_require_post_approval', 'no') === 'yes') {
+    add_action('transition_post_status', 'psc_alert_pending_post', 10, 3);
+}
+
+function psc_alert_pending_post($new_status, $old_status, $post) {
+    if ($post->post_type !== 'post') {
+        return;
+    }
+
+    // Only alert when transitioning to pending (usually from draft, auto-draft, or a blocked publish attempt)
+    if ($new_status === 'pending' && $old_status !== 'pending') {
+
+        $author = get_userdata($post->post_author);
+        $author_name = $author ? $author->user_login : 'Unknown User';
+
+        $edit_link = admin_url('post.php?action=edit&post=' . $post->ID);
+
+        $subject = '[Security Alert] Blog Post Requires Approval';
+        $message = "A new blog post has been submitted and requires administrator approval before it can be published.\n\n";
+        $message .= "Title: {$post->post_title}\n";
+        $message .= "Author: {$author_name}\n\n";
+        $message .= "You can review and publish this post here:\n{$edit_link}";
+
+        wp_mail(psc_get_alert_email(), $subject, $message);
+    }
 }

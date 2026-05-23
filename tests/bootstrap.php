@@ -1,4 +1,20 @@
 <?php
+
+if (!function_exists('wp_get_current_user')) {
+    function wp_get_current_user() {
+        global $mock_current_user_is_admin;
+        if (!class_exists('Mock_WP_User2')) {
+            class Mock_WP_User2 {
+                public $roles = [];
+                public function exists() { return true; }
+            }
+        }
+        $user = new Mock_WP_User2();
+        $user->roles = !empty($mock_current_user_is_admin) ? ['administrator'] : ['author'];
+        return $user;
+    }
+}
+
 // Mock WordPress functions
 if (!function_exists('get_option')) {
     function get_option($option, $default = false) {
@@ -152,6 +168,9 @@ if (!function_exists('remove_query_arg')) {
 }
 global $table_prefix;
 $table_prefix = 'wp_';
+
+
+
 
 // Include the plugin file to be tested
 
