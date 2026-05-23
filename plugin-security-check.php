@@ -1096,24 +1096,35 @@ function psc_scheduled_advanced_scan() {
     }
 
     // Check 4: Modified Plugin/Theme Files (Checksum baseline)
-    // To properly do this, we compare md5 hashes of the plugin directories over time.
-    // If a hash changes and wasn't preceded by a plugin update action, it's flagged.
-    $plugins_hash = psc_generate_directory_hash(WP_PLUGIN_DIR);
-    $themes_hash = psc_generate_directory_hash(get_theme_root());
+    $current_plugins_hash = psc_generate_directory_hash(WP_PLUGIN_DIR);
+    $current_themes_hash = psc_generate_directory_hash(get_theme_root());
 
-    $stored_plugins_hash = get_option('psc_plugins_baseline_hash', '');
-    $stored_themes_hash = get_option('psc_themes_baseline_hash', '');
+    $stored_plugins_hash = get_option('psc_plugins_baseline_hash', array());
+    $stored_themes_hash = get_option('psc_themes_baseline_hash', array());
+
+    // Handle backwards compatibility if it was previously a string
+    if (!is_array($stored_plugins_hash)) $stored_plugins_hash = array();
+    if (!is_array($stored_themes_hash)) $stored_themes_hash = array();
 
     if (empty($stored_plugins_hash)) {
-        update_option('psc_plugins_baseline_hash', $plugins_hash);
-    } elseif ($plugins_hash !== $stored_plugins_hash) {
-        $alerts[] = "Plugin files have been modified outside of standard updates!";
+        update_option('psc_plugins_baseline_hash', $current_plugins_hash, false);
+    } else {
+        $plugin_report = psc_compare_file_hashes($stored_plugins_hash, $current_plugins_hash, 'Plugin');
+        if ($plugin_report) {
+            $alerts[] = $plugin_report;
+            // Update baseline so we don't alert repeatedly for the same change
+            update_option('psc_plugins_baseline_hash', $current_plugins_hash, false);
+        }
     }
 
     if (empty($stored_themes_hash)) {
-        update_option('psc_themes_baseline_hash', $themes_hash);
-    } elseif ($themes_hash !== $stored_themes_hash) {
-        $alerts[] = "Theme files have been modified outside of standard updates!";
+        update_option('psc_themes_baseline_hash', $current_themes_hash, false);
+    } else {
+        $theme_report = psc_compare_file_hashes($stored_themes_hash, $current_themes_hash, 'Theme');
+        if ($theme_report) {
+            $alerts[] = $theme_report;
+            update_option('psc_themes_baseline_hash', $current_themes_hash, false);
+        }
     }
 
     if (!empty($alerts)) {
@@ -1126,24 +1137,63 @@ function psc_scheduled_advanced_scan() {
 }
 
 function psc_generate_directory_hash($dir) {
-    if (!is_dir($dir)) return '';
+    if (!is_dir($dir)) return array();
     $files = array();
     $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
     foreach ($iterator as $file) {
         if ($file->isDir()) continue;
-        $files[] = md5_file($file->getPathname());
+        $path = $file->getPathname();
+        $files[$path] = md5_file($path);
     }
-    sort($files);
-    return md5(implode('', $files));
+    return $files;
+}
+
+function psc_compare_file_hashes($old_hashes, $new_hashes, $type) {
+    if (!is_array($old_hashes) || !is_array($new_hashes)) return false;
+
+    $added = array();
+    $deleted = array();
+    $modified = array();
+
+    foreach ($new_hashes as $file => $hash) {
+        if (!isset($old_hashes[$file])) {
+            $added[] = $file;
+        } elseif ($old_hashes[$file] !== $hash) {
+            $modified[] = $file;
+        }
+    }
+
+    foreach ($old_hashes as $file => $hash) {
+        if (!isset($new_hashes[$file])) {
+            $deleted[] = $file;
+        }
+    }
+
+    if (empty($added) && empty($deleted) && empty($modified)) {
+        return false;
+    }
+
+    $report = "{$type} files have been modified outside of standard updates!\n";
+    if (!empty($added)) {
+        $report .= "\n[ADDED FILES]\n- " . implode("\n- ", $added) . "\n";
+    }
+    if (!empty($modified)) {
+        $report .= "\n[MODIFIED FILES]\n- " . implode("\n- ", $modified) . "\n";
+    }
+    if (!empty($deleted)) {
+        $report .= "\n[DELETED FILES]\n- " . implode("\n- ", $deleted) . "\n";
+    }
+
+    return $report;
 }
 
 // Update baselines when admins intentionally update plugins/themes
 add_action('upgrader_process_complete', 'psc_update_baselines_on_upgrade', 10, 2);
 function psc_update_baselines_on_upgrade($upgrader_object, $options) {
     if ($options['type'] === 'plugin') {
-        update_option('psc_plugins_baseline_hash', psc_generate_directory_hash(WP_PLUGIN_DIR));
+        update_option('psc_plugins_baseline_hash', psc_generate_directory_hash(WP_PLUGIN_DIR), false);
     } elseif ($options['type'] === 'theme') {
-        update_option('psc_themes_baseline_hash', psc_generate_directory_hash(get_theme_root()));
+        update_option('psc_themes_baseline_hash', psc_generate_directory_hash(get_theme_root()), false);
     }
 }
 
