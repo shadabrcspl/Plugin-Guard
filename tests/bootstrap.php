@@ -205,3 +205,8 @@ if (!class_exists('Mock_WPDB')) {
 }
 global $wpdb;
 $wpdb = new Mock_WPDB();
+
+$_SERVER['REMOTE_ADDR'] = '192.168.1.1';
+if (!function_exists('current_time')) {
+    function current_time($type) { return '2023-01-01 12:00:00'; }
+}

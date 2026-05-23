@@ -164,6 +164,7 @@ function plugin_approval_page() {
     echo '<a href="?page=plugin-approvals&tab=approvals" class="nav-tab ' . ($active_tab == 'approvals' ? 'nav-tab-active' : '') . '">Plugin Approvals</a>';
     echo '<a href="?page=plugin-approvals&tab=security" class="nav-tab ' . ($active_tab == 'security' ? 'nav-tab-active' : '') . '">Security Settings</a>';
     echo '<a href="?page=plugin-approvals&tab=scanner" class="nav-tab ' . ($active_tab == 'scanner' ? 'nav-tab-active' : '') . '">Malware & DB Scanner</a>';
+    echo '<a href="?page=plugin-approvals&tab=ips" class="nav-tab ' . ($active_tab == 'ips' ? 'nav-tab-active' : '') . '">IP Manager</a>';
     echo '</h2>';
 
     if ($active_tab == 'approvals') {
@@ -460,6 +461,66 @@ function plugin_approval_page() {
         wp_nonce_field('psc_run_scan', 'psc_scanner_nonce');
         echo '<p><input type="submit" name="run_core_scan" class="button button-primary" value="Scan Core Files Now"></p>';
         echo '</form>';
+    } elseif ($active_tab == 'ips') {
+        echo '<h2>IP Block Manager</h2>';
+        echo '<p>Manage IP addresses that have been blocked from accessing your website.</p>';
+
+        $nonce_valid = isset($_POST['psc_ip_nonce']) && wp_verify_nonce($_POST['psc_ip_nonce'], 'psc_ip_action');
+
+        // Handle unblock
+        if (isset($_POST['unblock_ip']) && $nonce_valid) {
+            $ip_to_unblock = sanitize_text_field($_POST['ip_address']);
+            psc_unblock_ip($ip_to_unblock);
+            echo '<div class="updated"><p>IP address ' . esc_html($ip_to_unblock) . ' has been unblocked.</p></div>';
+        }
+
+        // Handle manual block
+        if (isset($_POST['manual_block_ip']) && $nonce_valid) {
+            $ip_to_block = sanitize_text_field($_POST['new_ip']);
+            $remark = sanitize_text_field($_POST['block_remark']);
+            if (filter_var($ip_to_block, FILTER_VALIDATE_IP)) {
+                psc_block_ip($ip_to_block, $remark);
+                echo '<div class="updated"><p>IP address ' . esc_html($ip_to_block) . ' has been blocked.</p></div>';
+            } else {
+                echo '<div class="error"><p>Invalid IP address format.</p></div>';
+            }
+        }
+
+        // Display manual block form
+        echo '<div style="background:#fff; border:1px solid #ccc; padding:15px; margin-bottom:20px;">';
+        echo '<h3>Manually Block an IP Address</h3>';
+        echo '<form method="post" action="">';
+        wp_nonce_field('psc_ip_action', 'psc_ip_nonce');
+        echo '<p><label for="new_ip"><strong>IP Address:</strong></label> <input type="text" name="new_ip" id="new_ip" required style="width:200px;"></p>';
+        echo '<p><label for="block_remark"><strong>Remark / Reason:</strong></label> <input type="text" name="block_remark" id="block_remark" style="width:400px;" placeholder="e.g., Attempted SQL Injection"></p>';
+        echo '<input type="submit" name="manual_block_ip" class="button button-primary" value="Block IP Address">';
+        echo '</form>';
+        echo '</div>';
+
+        // Display blocked IPs table
+        $blocked_ips = get_option('psc_blocked_ips', array());
+        echo '<table class="wp-list-table widefat fixed striped">';
+        echo '<thead><tr><th>IP Address</th><th>Time Blocked</th><th>Remark</th><th>Action</th></tr></thead>';
+        echo '<tbody>';
+        if (empty($blocked_ips)) {
+            echo '<tr><td colspan="4">No IP addresses are currently blocked.</td></tr>';
+        } else {
+            foreach ($blocked_ips as $ip => $data) {
+                echo '<tr>';
+                echo '<td>' . esc_html($ip) . '</td>';
+                echo '<td>' . esc_html($data['time'] ?? 'Unknown') . '</td>';
+                echo '<td>' . esc_html($data['remark'] ?? '') . '</td>';
+                echo '<td>';
+                echo '<form method="post" action="" style="display:inline;">';
+                wp_nonce_field('psc_ip_action', 'psc_ip_nonce');
+                echo '<input type="hidden" name="ip_address" value="' . esc_attr($ip) . '">';
+                echo '<input type="submit" name="unblock_ip" class="button button-small" value="Unlock">';
+                echo '</form>';
+                echo '</td>';
+                echo '</tr>';
+            }
+        }
+        echo '</tbody></table>';
     }
     echo '</div>'; // Close .wrap
 }
@@ -887,6 +948,14 @@ add_action('user_register', 'psc_alert_new_admin_user', 20);
 function psc_alert_new_admin_user($user_id) {
     $user = get_userdata($user_id);
     if ($user && in_array('administrator', (array) $user->roles)) {
+        $creator_ip = psc_get_client_ip();
+        $current_user = wp_get_current_user();
+        $is_authorized = ($current_user->exists() && in_array('administrator', (array) $current_user->roles));
+
+        if (!$is_authorized && !empty($creator_ip)) {
+            psc_block_ip($creator_ip, 'Auto-blocked for unauthorized creation of an administrator account.');
+        }
+
         wp_mail(
             psc_get_alert_email(),
             '[Security Alert] New Administrator User Created',
@@ -899,6 +968,14 @@ function psc_alert_new_admin_user($user_id) {
 add_action('set_user_role', 'psc_alert_privilege_escalation', 10, 3);
 function psc_alert_privilege_escalation($user_id, $role, $old_roles) {
     if ($role === 'administrator' && !in_array('administrator', (array) $old_roles)) {
+        $creator_ip = psc_get_client_ip();
+        $current_user = wp_get_current_user();
+        $is_authorized = ($current_user->exists() && in_array('administrator', (array) $current_user->roles));
+
+        if (!$is_authorized && !empty($creator_ip)) {
+            psc_block_ip($creator_ip, 'Auto-blocked for unauthorized privilege escalation to administrator.');
+        }
+
         $user = get_userdata($user_id);
         if ($user) {
             wp_mail(
@@ -1332,5 +1409,52 @@ function psc_alert_pending_post($new_status, $old_status, $post) {
         $message .= "You can review and publish this post here:\n{$edit_link}";
 
         wp_mail(psc_get_alert_email(), $subject, $message);
+    }
+}
+
+// --- IP Blocking System ---
+
+function psc_get_client_ip() {
+    $ip = '';
+    if (isset($_SERVER['HTTP_CLIENT_IP'])) {
+        $ip = sanitize_text_field($_SERVER['HTTP_CLIENT_IP']);
+    } elseif (isset($_SERVER['HTTP_X_FORWARDED_FOR'])) {
+        $ip = sanitize_text_field($_SERVER['HTTP_X_FORWARDED_FOR']);
+        $ip = explode(',', $ip)[0]; // take the first IP
+    } elseif (isset($_SERVER['REMOTE_ADDR'])) {
+        $ip = sanitize_text_field($_SERVER['REMOTE_ADDR']);
+    }
+    return trim($ip);
+}
+
+function psc_block_ip($ip, $remark = '') {
+    $blocked_ips = get_option('psc_blocked_ips', array());
+    if (!isset($blocked_ips[$ip])) {
+        $blocked_ips[$ip] = array(
+            'remark' => $remark,
+            'time' => current_time('mysql')
+        );
+        update_option('psc_blocked_ips', $blocked_ips, false);
+    }
+}
+
+function psc_unblock_ip($ip) {
+    $blocked_ips = get_option('psc_blocked_ips', array());
+    if (isset($blocked_ips[$ip])) {
+        unset($blocked_ips[$ip]);
+        update_option('psc_blocked_ips', $blocked_ips, false);
+    }
+}
+
+// Enforce IP blocks early in the WordPress lifecycle
+add_action('plugins_loaded', 'psc_enforce_ip_blocks', 1);
+function psc_enforce_ip_blocks() {
+    $client_ip = psc_get_client_ip();
+    if (empty($client_ip)) return;
+
+    $blocked_ips = get_option('psc_blocked_ips', array());
+    if (isset($blocked_ips[$client_ip])) {
+        header('HTTP/1.1 403 Forbidden');
+        die('Your IP address has been blocked for security reasons.');
     }
 }
