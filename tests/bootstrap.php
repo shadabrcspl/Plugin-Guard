@@ -210,3 +210,25 @@ $_SERVER['REMOTE_ADDR'] = '192.168.1.1';
 if (!function_exists('current_time')) {
     function current_time($type) { return '2023-01-01 12:00:00'; }
 }
+
+if (!function_exists('get_posts')) {
+    function get_posts($args = array()) {
+        $post = new stdClass();
+        $post->ID = 123;
+        $post->post_title = 'Test Pending Post';
+        $post->post_author = 1;
+        return array($post);
+    }
+}
+
+if (!function_exists('wp_update_post')) {
+    function wp_update_post($postarr = array(), $wp_error = false, $fire_after_hooks = true) {
+        return 123;
+    }
+}
+
+if (!function_exists('wp_trash_post')) {
+    function wp_trash_post($post_id) {
+        return true;
+    }
+}

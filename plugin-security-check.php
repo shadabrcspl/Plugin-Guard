@@ -165,6 +165,7 @@ function plugin_approval_page() {
     echo '<a href="?page=plugin-approvals&tab=security" class="nav-tab ' . ($active_tab == 'security' ? 'nav-tab-active' : '') . '">Security Settings</a>';
     echo '<a href="?page=plugin-approvals&tab=scanner" class="nav-tab ' . ($active_tab == 'scanner' ? 'nav-tab-active' : '') . '">Malware & DB Scanner</a>';
     echo '<a href="?page=plugin-approvals&tab=ips" class="nav-tab ' . ($active_tab == 'ips' ? 'nav-tab-active' : '') . '">IP Manager</a>';
+    echo '<a href="?page=plugin-approvals&tab=posts" class="nav-tab ' . ($active_tab == 'posts' ? 'nav-tab-active' : '') . '">Post Approvals</a>';
     echo '</h2>';
 
     if ($active_tab == 'approvals') {
@@ -515,6 +516,82 @@ function plugin_approval_page() {
                 wp_nonce_field('psc_ip_action', 'psc_ip_nonce');
                 echo '<input type="hidden" name="ip_address" value="' . esc_attr($ip) . '">';
                 echo '<input type="submit" name="unblock_ip" class="button button-small" value="Unlock">';
+                echo '</form>';
+                echo '</td>';
+                echo '</tr>';
+            }
+        }
+        echo '</tbody></table>';
+    } elseif ($active_tab == 'posts') {
+        echo '<h2>Pending Post Approvals</h2>';
+        echo '<p>Review and approve blog posts submitted by non-administrators. You can optionally change the author of the post before publishing.</p>';
+
+        $nonce_valid = isset($_POST['psc_posts_nonce']) && wp_verify_nonce($_POST['psc_posts_nonce'], 'psc_posts_action');
+
+        // Handle post approval
+        if (isset($_POST['approve_post']) && $nonce_valid) {
+            $post_id = intval($_POST['post_id']);
+            $new_author_id = intval($_POST['post_author']);
+
+            if ($post_id > 0) {
+                $update_args = array(
+                    'ID'           => $post_id,
+                    'post_status'  => 'publish',
+                    'post_author'  => $new_author_id
+                );
+                wp_update_post($update_args);
+                echo '<div class="updated"><p>Post successfully approved and published!</p></div>';
+            }
+        }
+
+        // Handle post rejection (move to trash)
+        if (isset($_POST['reject_post']) && $nonce_valid) {
+            $post_id = intval($_POST['post_id']);
+            if ($post_id > 0) {
+                wp_trash_post($post_id);
+                echo '<div class="updated"><p>Post rejected and moved to trash.</p></div>';
+            }
+        }
+
+        // Fetch pending posts
+        $pending_posts = get_posts(array(
+            'post_type'   => 'post',
+            'post_status' => 'pending',
+            'numberposts' => -1
+        ));
+
+        // Fetch all users for the author dropdown
+        $all_users = get_users();
+
+        echo '<table class="wp-list-table widefat fixed striped">';
+        echo '<thead><tr><th>Post Title</th><th>Current Author</th><th>Change Author To</th><th>Actions</th></tr></thead>';
+        echo '<tbody>';
+
+        if (empty($pending_posts)) {
+            echo '<tr><td colspan="4">No posts currently awaiting approval.</td></tr>';
+        } else {
+            foreach ($pending_posts as $post) {
+                $author_info = get_userdata($post->post_author);
+                $current_author_name = $author_info ? $author_info->user_login : 'Unknown';
+                $edit_url = admin_url('post.php?action=edit&post=' . $post->ID);
+
+                echo '<tr>';
+                echo '<td><strong><a href="' . esc_url($edit_url) . '" target="_blank">' . esc_html($post->post_title) . '</a></strong></td>';
+                echo '<td>' . esc_html($current_author_name) . '</td>';
+                echo '<td>';
+                echo '<form method="post" action="">';
+                wp_nonce_field('psc_posts_action', 'psc_posts_nonce');
+                echo '<input type="hidden" name="post_id" value="' . esc_attr($post->ID) . '">';
+                echo '<select name="post_author">';
+                foreach ($all_users as $user) {
+                    $selected = ($user->ID == $post->post_author) ? 'selected' : '';
+                    echo '<option value="' . esc_attr($user->ID) . '" ' . $selected . '>' . esc_html($user->user_login) . '</option>';
+                }
+                echo '</select>';
+                echo '</td>';
+                echo '<td>';
+                echo '<input type="submit" name="approve_post" class="button button-primary" value="Approve & Publish" style="margin-right:10px;">';
+                echo '<input type="submit" name="reject_post" class="button button-secondary" value="Reject (Trash)" onclick="return confirm(\'Are you sure you want to trash this post?\');">';
                 echo '</form>';
                 echo '</td>';
                 echo '</tr>';
