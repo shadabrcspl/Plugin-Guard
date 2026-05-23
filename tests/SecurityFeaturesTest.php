@@ -49,4 +49,30 @@ class SecurityFeaturesTest extends TestCase
 
         $this->assertInstanceOf('WP_Error', $result);
     }
+
+    public function testRequirePostApproval()
+    {
+        global $mock_current_user_is_admin;
+
+        $data = [
+            'post_type' => 'post',
+            'post_status' => 'publish'
+        ];
+
+        // Test 1: User is NOT admin
+        $mock_current_user_is_admin = false;
+        $result = psc_require_admin_approval_for_posts($data, []);
+        $this->assertEquals('pending', $result['post_status'], 'Post status should be forced to pending for non-admins');
+
+        // Test 2: User IS admin
+        $mock_current_user_is_admin = true;
+        $result = psc_require_admin_approval_for_posts($data, []);
+        $this->assertEquals('publish', $result['post_status'], 'Post status should remain publish for admins');
+
+        // Test 3: Not a post
+        $data['post_type'] = 'page';
+        $mock_current_user_is_admin = false;
+        $result = psc_require_admin_approval_for_posts($data, []);
+        $this->assertEquals('publish', $result['post_status'], 'Non-post types should not be affected');
+    }
 }
