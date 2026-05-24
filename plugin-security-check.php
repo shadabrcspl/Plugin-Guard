@@ -256,6 +256,7 @@ function plugin_approval_page() {
             if (isset($_POST['psc_blacklisted_domains'])) {
                 update_option('psc_blacklisted_domains', sanitize_textarea_field($_POST['psc_blacklisted_domains']));
             }
+            update_option('psc_redirect_404_to_home', isset($_POST['psc_redirect_404_to_home']) ? 'yes' : 'no');
 
             // Update root .htaccess based on new settings
             psc_update_root_htaccess();
@@ -418,6 +419,9 @@ function plugin_approval_page() {
 
         echo '<tr><th scope="row">Blacklisted Domains</th>';
         echo '<td><textarea name="psc_blacklisted_domains" rows="3" style="width: 100%;" placeholder="example.com&#10;spam-domain.net">' . esc_textarea(get_option('psc_blacklisted_domains', '')) . '</textarea><br><span class="description">One domain per line. Posts containing links to these domains will be flagged immediately.</span></td></tr>';
+
+        echo '<tr><th scope="row">Redirect 404s to Home</th>';
+        echo '<td><label><input type="checkbox" name="psc_redirect_404_to_home" value="1" ' . checked(get_option('psc_redirect_404_to_home', 'no'), 'yes', false) . '> Automatically 301 redirect all 404 Not Found errors to the homepage to preserve SEO juice from deleted spam URLs.</label></td></tr>';
 
         echo '</table>';
         echo '<p class="submit"><input type="submit" name="save_security_settings" class="button button-primary" value="Save Settings"></p>';
@@ -1655,4 +1659,16 @@ function psc_post_creation_monitor_filter($data, $postarr) {
     }
 
     return $data;
+}
+
+// 404 to Homepage Redirect
+if (get_option('psc_redirect_404_to_home', 'no') === 'yes') {
+    add_action('template_redirect', 'psc_redirect_404_to_home_action');
+}
+
+function psc_redirect_404_to_home_action() {
+    if (is_404()) {
+        wp_redirect(home_url(), 301);
+        die();
+    }
 }

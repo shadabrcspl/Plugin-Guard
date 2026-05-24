@@ -258,3 +258,10 @@ if (!function_exists('psc_get_client_ip')) {
     // Provide a mocked get_client_ip if tests run before plugin load
     $_SERVER['REMOTE_ADDR'] = '127.0.0.1';
 }
+
+if (!function_exists('is_404')) {
+    function is_404() {
+        global $mock_is_404;
+        return !empty($mock_is_404);
+    }
+}
