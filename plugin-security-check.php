@@ -166,6 +166,7 @@ function plugin_approval_page() {
     echo '<a href="?page=plugin-approvals&tab=scanner" class="nav-tab ' . ($active_tab == 'scanner' ? 'nav-tab-active' : '') . '">Malware & DB Scanner</a>';
     echo '<a href="?page=plugin-approvals&tab=ips" class="nav-tab ' . ($active_tab == 'ips' ? 'nav-tab-active' : '') . '">IP Manager</a>';
     echo '<a href="?page=plugin-approvals&tab=posts" class="nav-tab ' . ($active_tab == 'posts' ? 'nav-tab-active' : '') . '">Post Approvals</a>';
+    echo '<a href="?page=plugin-approvals&tab=404logs" class="nav-tab ' . ($active_tab == '404logs' ? 'nav-tab-active' : '') . '">404 Logs</a>';
     echo '</h2>';
 
     if ($active_tab == 'approvals') {
@@ -614,6 +615,81 @@ function plugin_approval_page() {
                 echo '<input type="submit" name="reject_post" class="button button-secondary" value="Reject (Trash)" onclick="return confirm(\'Are you sure you want to trash this post?\');">';
                 echo '</form>';
                 echo '</td>';
+                echo '</tr>';
+            }
+        }
+        echo '</tbody></table>';
+    } elseif ($active_tab == '404logs') {
+        echo '<h2>404 Error Logs & Redirects</h2>';
+        echo '<p>View all 404 Not Found errors caught by the plugin. If "Redirect 404s to Home" is enabled in Security Settings, they will redirect to the homepage by default. You can override individual URLs to keep them as 404s, or set custom redirects.</p>';
+
+        $nonce_valid = isset($_POST['psc_404_nonce']) && wp_verify_nonce($_POST['psc_404_nonce'], 'psc_404_action');
+        $logs = get_option('psc_404_logs', array());
+        if (!is_array($logs)) $logs = array();
+
+        if ($nonce_valid) {
+            if (isset($_POST['action_delete'])) {
+                $url = esc_url_raw($_POST['log_url']);
+                if (isset($logs[$url])) {
+                    unset($logs[$url]);
+                    update_option('psc_404_logs', $logs, false);
+                    echo '<div class="updated"><p>Log entry deleted.</p></div>';
+                }
+            } elseif (isset($_POST['action_update'])) {
+                $url = esc_url_raw($_POST['log_url']);
+                $action_type = sanitize_text_field($_POST['redirect_action']);
+                $custom_url = esc_url_raw($_POST['custom_url']);
+
+                if (isset($logs[$url])) {
+                    $logs[$url]['action'] = $action_type;
+                    $logs[$url]['custom_url'] = $custom_url;
+                    update_option('psc_404_logs', $logs, false);
+                    echo '<div class="updated"><p>URL action updated successfully.</p></div>';
+                }
+            }
+        }
+
+        echo '<table class="wp-list-table widefat fixed striped">';
+        echo '<thead><tr><th style="width:35%;">URL</th><th>Hits</th><th>Last Hit</th><th>Action</th><th style="width:15%;">Manage</th></tr></thead>';
+        echo '<tbody>';
+        if (empty($logs)) {
+            echo '<tr><td colspan="5">No 404 errors have been logged yet.</td></tr>';
+        } else {
+            // Sort by hits descending
+            uasort($logs, function($a, $b) { return $b['hits'] - $a['hits']; });
+
+            foreach ($logs as $url => $data) {
+                $action = isset($data['action']) ? $data['action'] : 'home';
+                $custom_url = isset($data['custom_url']) ? $data['custom_url'] : '';
+
+                echo '<tr>';
+                echo '<td style="word-break: break-all;">' . esc_html($url) . '</td>';
+                echo '<td>' . intval($data['hits']) . '</td>';
+                echo '<td>' . esc_html($data['last_hit']) . '</td>';
+
+                echo '<td>';
+                echo '<form method="post" action="">';
+                wp_nonce_field('psc_404_action', 'psc_404_nonce');
+                echo '<input type="hidden" name="log_url" value="' . esc_attr($url) . '">';
+
+                echo '<select name="redirect_action" onchange="this.parentNode.querySelector(\'div.custom-url-container\').style.display = (this.value == \'custom\') ? \'block\' : \'none\';">';
+                echo '<option value="home" ' . selected($action, 'home', false) . '>Redirect to Home</option>';
+                echo '<option value="keep" ' . selected($action, 'keep', false) . '>Keep as 404 (No redirect)</option>';
+                echo '<option value="custom" ' . selected($action, 'custom', false) . '>Custom Redirect</option>';
+                echo '</select>';
+
+                $display = ($action === 'custom') ? 'block' : 'none';
+                echo '<div class="custom-url-container" style="display:' . $display . '; margin-top:5px;">';
+                echo '<input type="url" name="custom_url" placeholder="https://..." value="' . esc_attr($custom_url) . '" style="width:100%;">';
+                echo '</div>';
+                echo '</td>';
+
+                echo '<td>';
+                echo '<input type="submit" name="action_update" class="button button-small button-primary" value="Save" style="margin-right:5px;">';
+                echo '<input type="submit" name="action_delete" class="button button-small button-link-delete" style="color:#a00;" value="Delete">';
+                echo '</form>';
+                echo '</td>';
+
                 echo '</tr>';
             }
         }
@@ -1668,6 +1744,42 @@ if (get_option('psc_redirect_404_to_home', 'no') === 'yes') {
 
 function psc_redirect_404_to_home_action() {
     if (is_404()) {
+        // Capture the requested URL
+        $requested_url = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? "https" : "http") . "://$_SERVER[HTTP_HOST]$_SERVER[REQUEST_URI]";
+
+        // Load logs
+        $logs = get_option('psc_404_logs', array());
+        if (!is_array($logs)) $logs = array();
+
+        // Update log entry
+        if (isset($logs[$requested_url])) {
+            $logs[$requested_url]['hits'] = isset($logs[$requested_url]['hits']) ? $logs[$requested_url]['hits'] + 1 : 1;
+            $logs[$requested_url]['last_hit'] = current_time('mysql');
+        } else {
+            // Keep array size manageable to prevent DB bloat
+            if (count($logs) > 500) {
+                array_shift($logs);
+            }
+            $logs[$requested_url] = array(
+                'hits' => 1,
+                'last_hit' => current_time('mysql'),
+                'action' => 'home', // default action
+                'custom_url' => ''
+            );
+        }
+
+        update_option('psc_404_logs', $logs, false);
+
+        // Execute action based on log setting
+        $action = $logs[$requested_url]['action'];
+        if ($action === 'keep') {
+            return; // Don't redirect, stay as 404
+        } elseif ($action === 'custom' && !empty($logs[$requested_url]['custom_url'])) {
+            wp_redirect($logs[$requested_url]['custom_url'], 301);
+            die();
+        }
+
+        // Default action: Redirect to home
         wp_redirect(home_url(), 301);
         die();
     }
