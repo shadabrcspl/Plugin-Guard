@@ -249,6 +249,13 @@ function plugin_approval_page() {
             update_option('psc_disallow_file_mods', isset($_POST['psc_disallow_file_mods']) ? 'yes' : 'no');
             update_option('psc_hide_wp_version', isset($_POST['psc_hide_wp_version']) ? 'yes' : 'no');
             update_option('psc_require_post_approval', isset($_POST['psc_require_post_approval']) ? 'yes' : 'no');
+            update_option('psc_enable_post_monitor', isset($_POST['psc_enable_post_monitor']) ? 'yes' : 'no');
+            if (isset($_POST['psc_max_external_links'])) {
+                update_option('psc_max_external_links', intval($_POST['psc_max_external_links']));
+            }
+            if (isset($_POST['psc_blacklisted_domains'])) {
+                update_option('psc_blacklisted_domains', sanitize_textarea_field($_POST['psc_blacklisted_domains']));
+            }
 
             // Update root .htaccess based on new settings
             psc_update_root_htaccess();
@@ -402,6 +409,15 @@ function plugin_approval_page() {
 
         echo '<tr><th scope="row">Require Post Approval</th>';
         echo '<td><label><input type="checkbox" name="psc_require_post_approval" value="1" ' . checked(get_option('psc_require_post_approval', 'no'), 'yes', false) . '> Require admin approval before non-admins can publish blog posts</label></td></tr>';
+
+        echo '<tr><th scope="row">Enable Post Creation Monitor</th>';
+        echo '<td><label><input type="checkbox" name="psc_enable_post_monitor" value="1" ' . checked(get_option('psc_enable_post_monitor', 'no'), 'yes', false) . '> Automatically force posts to Draft/Pending if they contain suspicious links or look like bulk spam.</label></td></tr>';
+
+        echo '<tr><th scope="row">Max External Links</th>';
+        echo '<td><input type="number" name="psc_max_external_links" value="' . esc_attr(get_option('psc_max_external_links', 5)) . '" style="width: 60px;"> <span class="description">Maximum external links allowed before a post is flagged.</span></td></tr>';
+
+        echo '<tr><th scope="row">Blacklisted Domains</th>';
+        echo '<td><textarea name="psc_blacklisted_domains" rows="3" style="width: 100%;" placeholder="example.com&#10;spam-domain.net">' . esc_textarea(get_option('psc_blacklisted_domains', '')) . '</textarea><br><span class="description">One domain per line. Posts containing links to these domains will be flagged immediately.</span></td></tr>';
 
         echo '</table>';
         echo '<p class="submit"><input type="submit" name="save_security_settings" class="button button-primary" value="Save Settings"></p>';
@@ -1534,4 +1550,109 @@ function psc_enforce_ip_blocks() {
         header('HTTP/1.1 403 Forbidden');
         die('Your IP address has been blocked for security reasons.');
     }
+}
+
+// Post Creation Monitor
+if (get_option('psc_enable_post_monitor', 'no') === 'yes') {
+    // Priority 11 so it runs after our existing approval system
+    add_filter('wp_insert_post_data', 'psc_post_creation_monitor_filter', 11, 2);
+}
+
+function psc_post_creation_monitor_filter($data, $postarr) {
+    if ($data['post_type'] !== 'post') {
+        return $data;
+    }
+
+    // Do not interfere if an administrator is the one publishing/updating the post.
+    // This solves the "Impossible to Approve" infinite loop problem.
+    if (function_exists('wp_get_current_user')) {
+        $user = wp_get_current_user();
+        if ($user->exists() && in_array('administrator', (array) $user->roles)) {
+            return $data;
+        }
+    }
+
+    // We only need to check if the post is trying to be published/scheduled and is not already pending
+    if (in_array($data['post_status'], array('publish', 'future'))) {
+
+        $should_flag = false;
+        $reason = '';
+
+        // Determine if this is a brand new post being created, or an update.
+        // If $postarr['ID'] is empty or 0 (or matches a new auto-draft ID), it's new.
+        // WordPress often sends ID = 0 for brand new inserts before the DB write.
+        $is_new_post = empty($postarr['ID']) || (isset($postarr['post_status']) && $postarr['post_status'] === 'auto-draft');
+
+        // 1. Bulk Post Creation Detection (Rate Limiting) - ONLY ON NEW POSTS
+        $client_ip = psc_get_client_ip();
+        if ($is_new_post && !empty($client_ip)) {
+            $transient_name = 'psc_post_rate_' . md5($client_ip);
+            $recent_posts = (int) get_transient($transient_name);
+
+            // Allow 3 posts per 3 minutes max. If exceeded, flag it.
+            if ($recent_posts >= 3) {
+                $should_flag = true;
+                $reason = 'Bulk post creation detected from IP.';
+            } else {
+                set_transient($transient_name, $recent_posts + 1, 3 * MINUTE_IN_SECONDS);
+            }
+        }
+
+        // 2. Suspicious Link Checks
+        if (!$should_flag && !empty($data['post_content'])) {
+            $content = $data['post_content'];
+            $site_domain = parse_url(home_url(), PHP_URL_HOST);
+
+            // Extract all URLs
+            preg_match_all('/href=["\'](http[s]?:\/\/[^"\']+)["\']/i', $content, $matches);
+            $links = !empty($matches[1]) ? $matches[1] : array();
+
+            $external_links_count = 0;
+            $raw_blacklist = get_option('psc_blacklisted_domains', '');
+            $blacklisted_domains = array_filter(array_map('trim', explode("\n", $raw_blacklist)));
+
+            foreach ($links as $link) {
+                $link_domain = parse_url($link, PHP_URL_HOST);
+                if (!$link_domain) continue;
+
+                // If it's an external link
+                if (strcasecmp($link_domain, $site_domain) !== 0 && strcasecmp($link_domain, 'www.' . $site_domain) !== 0) {
+                    $external_links_count++;
+
+                    // Check against blacklist
+                    foreach ($blacklisted_domains as $bad_domain) {
+                        if (stripos($link_domain, $bad_domain) !== false) {
+                            $should_flag = true;
+                            $reason = 'Contains blacklisted domain: ' . $bad_domain;
+                            break 2;
+                        }
+                    }
+                }
+            }
+
+            // Check max external links threshold
+            if (!$should_flag) {
+                $max_allowed = (int) get_option('psc_max_external_links', 5);
+                if ($external_links_count > $max_allowed) {
+                    $should_flag = true;
+                    $reason = "Exceeded maximum allowed external links ({$external_links_count} > {$max_allowed}).";
+                }
+            }
+        }
+
+        if ($should_flag) {
+            $data['post_status'] = 'pending';
+
+            // Send alert
+            $subject = '[Security Alert] Suspicious Post Flagged';
+            $message = "The Post Creation Monitor has intercepted a suspicious post and moved it to Pending Review.\n\n";
+            $message .= "Post Title: {$data['post_title']}\n";
+            $message .= "Reason: {$reason}\n";
+            $message .= "Author IP: {$client_ip}\n\n";
+            $message .= "Please review the post carefully before publishing.";
+            wp_mail(psc_get_alert_email(), $subject, $message);
+        }
+    }
+
+    return $data;
 }

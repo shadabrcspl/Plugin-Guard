@@ -75,4 +75,47 @@ class SecurityFeaturesTest extends TestCase
         $result = psc_require_admin_approval_for_posts($data, []);
         $this->assertEquals('publish', $result['post_status'], 'Non-post types should not be affected');
     }
+
+    public function testPostCreationMonitorLinks()
+    {
+        global $mock_current_user_is_admin;
+        $mock_current_user_is_admin = false;
+
+        $data = [
+            'post_type' => 'post',
+            'post_status' => 'publish',
+            'post_title' => 'Test Post',
+            'post_content' => '<a href="http://bad-domain.com/spam">Spam</a>'
+        ];
+
+        // 1. Test Blacklisted Domains
+        update_option('psc_blacklisted_domains', "bad-domain.com\nanother-spam.net");
+        $result = psc_post_creation_monitor_filter($data, []);
+        $this->assertEquals('pending', $result['post_status'], 'Post should be pending due to blacklisted domain');
+
+        // 2. Test Max External Links
+        update_option('psc_blacklisted_domains', '');
+        update_option('psc_max_external_links', 2);
+
+        // Mock home_url so we know what internal is
+
+        $data['post_content'] = '
+            <a href="http://external.org/1">1</a>
+            <a href="https://external.com/2">2</a>
+            <a href="http://external-test.com/3">3</a>
+        ';
+        $data['post_status'] = 'publish'; // reset
+        // Reset IP rate limiter transient for this test step
+        global $mock_transients;
+        $mock_transients = [];
+
+        $result = psc_post_creation_monitor_filter($data, []);
+        $this->assertEquals('pending', $result['post_status'], 'Post should be pending due to exceeding max external links');
+
+        // 3. Test Safe Post
+        $data['post_content'] = '<a href="http://example.org/1">1</a>';
+        $data['post_status'] = 'publish';
+        $result = psc_post_creation_monitor_filter($data, []);
+        $this->assertEquals('publish', $result['post_status'], 'Safe post should remain published');
+    }
 }

@@ -232,3 +232,29 @@ if (!function_exists('wp_trash_post')) {
         return true;
     }
 }
+
+// Transient Mocks
+global $mock_transients;
+$mock_transients = array();
+
+if (!function_exists('get_transient')) {
+    function get_transient($transient) {
+        global $mock_transients;
+        return isset($mock_transients[$transient]) ? $mock_transients[$transient] : false;
+    }
+}
+if (!function_exists('set_transient')) {
+    function set_transient($transient, $value, $expiration = 0) {
+        global $mock_transients;
+        $mock_transients[$transient] = $value;
+        return true;
+    }
+}
+if (!defined('MINUTE_IN_SECONDS')) {
+    define('MINUTE_IN_SECONDS', 60);
+}
+
+if (!function_exists('psc_get_client_ip')) {
+    // Provide a mocked get_client_ip if tests run before plugin load
+    $_SERVER['REMOTE_ADDR'] = '127.0.0.1';
+}
