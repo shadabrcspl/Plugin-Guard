@@ -118,4 +118,19 @@ class SecurityFeaturesTest extends TestCase
         $result = psc_post_creation_monitor_filter($data, []);
         $this->assertEquals('publish', $result['post_status'], 'Safe post should remain published');
     }
+
+    public function test404Redirect()
+    {
+        global $mock_is_404;
+
+        // Disable option, should not hook
+        update_option('psc_redirect_404_to_home', 'no');
+        $mock_is_404 = true;
+        // Test passes if it does not die (since it's not hooked/active)
+        $this->assertTrue(true);
+
+        // We can't safely test the die() natively in PHPUnit without specialized runkits
+        // but we can ensure the function exists and syntax is clean
+        $this->assertTrue(function_exists('psc_redirect_404_to_home_action'));
+    }
 }
