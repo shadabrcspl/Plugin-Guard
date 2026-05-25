@@ -442,6 +442,12 @@ function plugin_approval_page() {
         echo '<h2>Malware & DB Scanner</h2>';
         echo '<p>This tool checks your WordPress core files against the official checksums from WordPress.org to detect malicious modifications.</p>';
 
+        if (isset($_POST['delete_suspicious_option']) && isset($_POST['psc_delete_option_nonce']) && wp_verify_nonce($_POST['psc_delete_option_nonce'], 'psc_delete_option')) {
+            $option_to_delete = sanitize_text_field($_POST['option_name']);
+            delete_option($option_to_delete);
+            echo '<div class="updated"><p>Suspicious option <strong>' . esc_html($option_to_delete) . '</strong> has been deleted.</p></div>';
+        }
+
         if (isset($_POST['run_core_scan']) && isset($_POST['psc_scanner_nonce']) && wp_verify_nonce($_POST['psc_scanner_nonce'], 'psc_run_scan')) {
             psc_run_core_checksum_scan();
             psc_run_malware_scan();
@@ -946,7 +952,12 @@ function psc_run_database_checks() {
     if (!empty($suspicious_options)) {
         echo '<h4 style="color:red; margin-top: 15px;">Suspicious Database Options Found:</h4><ul>';
         foreach ($suspicious_options as $opt_name) {
-            echo '<li><code>' . esc_html($opt_name) . '</code> (Potential malicious payload detected)</li>';
+            echo '<li style="margin-bottom: 10px;"><code>' . esc_html($opt_name) . '</code> (Potential malicious payload detected)';
+            echo ' <form method="post" action="" style="display:inline;" onsubmit="return confirm(\'Are you sure you want to delete this option?\');">';
+            wp_nonce_field('psc_delete_option', 'psc_delete_option_nonce');
+            echo '<input type="hidden" name="option_name" value="' . esc_attr($opt_name) . '">';
+            echo '<input type="submit" name="delete_suspicious_option" value="Delete Option" class="button button-small" style="color:red; border-color:red;">';
+            echo '</form></li>';
         }
         echo '</ul><p>Please review these options in your database via phpMyAdmin or a database manager plugin.</p>';
     } else {
