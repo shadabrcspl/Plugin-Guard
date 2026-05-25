@@ -479,6 +479,15 @@ function plugin_approval_page() {
             psc_repair_core_files();
         }
 
+        if (isset($_POST['delete_db_option']) && isset($_POST['psc_scanner_nonce']) && wp_verify_nonce($_POST['psc_scanner_nonce'], 'psc_delete_option')) {
+            $option_name = sanitize_text_field($_POST['option_name']);
+            if (delete_option($option_name)) {
+                echo '<div class="updated"><p>Database option <strong>' . esc_html($option_name) . '</strong> was successfully deleted.</p></div>';
+            } else {
+                echo '<div class="error"><p>Failed to delete option <strong>' . esc_html($option_name) . '</strong>. It may have already been removed.</p></div>';
+            }
+        }
+
         echo '<form method="post" action="">';
         wp_nonce_field('psc_run_scan', 'psc_scanner_nonce');
         echo '<p><input type="submit" name="run_core_scan" class="button button-primary" value="Scan Core Files Now"></p>';
@@ -1198,11 +1207,25 @@ function psc_run_database_checks() {
 
     $suspicious_options = psc_get_suspicious_db_options();
     if (!empty($suspicious_options)) {
-        echo '<h4 style="color:red; margin-top: 15px;">Suspicious Database Options Found:</h4><ul>';
+        echo '<h4 style="color:red; margin-top: 15px;">Suspicious Database Options Found:</h4>';
+        echo '<p>The following options match known malware signatures. You can delete them here to clean your database.</p>';
+        echo '<table class="wp-list-table widefat fixed striped" style="margin-top:10px;">';
+        echo '<thead><tr><th>Option Name</th><th>Reason</th><th style="width:150px;">Action</th></tr></thead>';
+        echo '<tbody>';
         foreach ($suspicious_options as $opt_name) {
-            echo '<li><code>' . esc_html($opt_name) . '</code> (Potential malicious payload detected)</li>';
+            echo '<tr>';
+            echo '<td><code>' . esc_html($opt_name) . '</code></td>';
+            echo '<td><span style="color:red;">Potential malicious payload detected</span></td>';
+            echo '<td>';
+            echo '<form method="post" action="" onsubmit="return confirm(\'Are you sure you want to permanently delete this option?\');">';
+            wp_nonce_field('psc_delete_option', 'psc_scanner_nonce');
+            echo '<input type="hidden" name="option_name" value="' . esc_attr($opt_name) . '">';
+            echo '<input type="submit" name="delete_db_option" class="button button-small button-link-delete" style="color:#a00;" value="Delete Option">';
+            echo '</form>';
+            echo '</td>';
+            echo '</tr>';
         }
-        echo '</ul><p>Please review these options in your database via phpMyAdmin or a database manager plugin.</p>';
+        echo '</tbody></table>';
     } else {
         echo '<p style="color:green;"><strong>Clean:</strong> No suspicious payloads detected in the database options table.</p>';
     }
