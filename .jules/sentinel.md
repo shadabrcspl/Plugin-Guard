@@ -1,0 +1,4 @@
+## YYYY-MM-DD - IP Spoofing Prevention in Client IP Checks
+**Vulnerability:** The plugin's `psc_get_client_ip` function relied on user-provided HTTP headers (`HTTP_CLIENT_IP` and `HTTP_X_FORWARDED_FOR`) before falling back to `REMOTE_ADDR`. This allowed attackers to easily spoof their IP address.
+**Learning:** In a generic plugin, relying on proxy headers exposes the application to IP spoofing, allowing attackers to bypass IP-based rate limiting or blocklists. Trusting these headers should only be done via secure server configuration (like NGINX `real_ip_module`) or `wp-config.php` based on a trusted proxy list.
+**Prevention:** Always rely exclusively on `$_SERVER['REMOTE_ADDR']` to get the true client IP address at the plugin level unless the user has explicitly configured the plugin with trusted reverse proxy IPs.
