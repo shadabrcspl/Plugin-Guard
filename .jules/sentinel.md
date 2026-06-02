@@ -1,0 +1,4 @@
+## 2026-06-02 - [IP Spoofing via HTTP Headers]
+**Vulnerability:** The application was using `$_SERVER['HTTP_CLIENT_IP']` and `$_SERVER['HTTP_X_FORWARDED_FOR']` to determine the client's IP address. These headers are user-controlled and can be easily spoofed by attackers to bypass IP-based restrictions (like rate limits or blocklists).
+**Learning:** Never trust client-provided headers for security-sensitive operations like IP blocking or logging, as they are easily manipulated.
+**Prevention:** Exclusively use `$_SERVER['REMOTE_ADDR']` to reliably identify the true source IP of the connection, unless explicitly configured to trust a specific reverse proxy or load balancer.

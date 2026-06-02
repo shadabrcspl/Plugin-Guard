@@ -1612,12 +1612,10 @@ function psc_alert_pending_post($new_status, $old_status, $post) {
 
 function psc_get_client_ip() {
     $ip = '';
-    if (isset($_SERVER['HTTP_CLIENT_IP'])) {
-        $ip = sanitize_text_field($_SERVER['HTTP_CLIENT_IP']);
-    } elseif (isset($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-        $ip = sanitize_text_field($_SERVER['HTTP_X_FORWARDED_FOR']);
-        $ip = explode(',', $ip)[0]; // take the first IP
-    } elseif (isset($_SERVER['REMOTE_ADDR'])) {
+    // Security Fix: Do not trust HTTP_CLIENT_IP or HTTP_X_FORWARDED_FOR
+    // as they can be easily spoofed by attackers to bypass IP blocks.
+    // Only trust REMOTE_ADDR for the true client IP connection.
+    if (isset($_SERVER['REMOTE_ADDR'])) {
         $ip = sanitize_text_field($_SERVER['REMOTE_ADDR']);
     }
     return trim($ip);
