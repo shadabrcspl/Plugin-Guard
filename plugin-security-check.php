@@ -1611,13 +1611,10 @@ function psc_alert_pending_post($new_status, $old_status, $post) {
 // --- IP Blocking System ---
 
 function psc_get_client_ip() {
+    // 🛡️ SECURITY FIX: Use REMOTE_ADDR exclusively to prevent IP spoofing vulnerabilities.
+    // Trusting HTTP_CLIENT_IP or HTTP_X_FORWARDED_FOR allows attackers to bypass IP blocks.
     $ip = '';
-    if (isset($_SERVER['HTTP_CLIENT_IP'])) {
-        $ip = sanitize_text_field($_SERVER['HTTP_CLIENT_IP']);
-    } elseif (isset($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-        $ip = sanitize_text_field($_SERVER['HTTP_X_FORWARDED_FOR']);
-        $ip = explode(',', $ip)[0]; // take the first IP
-    } elseif (isset($_SERVER['REMOTE_ADDR'])) {
+    if (isset($_SERVER['REMOTE_ADDR'])) {
         $ip = sanitize_text_field($_SERVER['REMOTE_ADDR']);
     }
     return trim($ip);
