@@ -635,6 +635,90 @@ class SecurityFeaturesTest extends TestCase
         unlink( $conf_file );
     }
 
+    // ── 29. Manual Whitelist Management ────────────────────────────
+
+    public function testManualWhitelistAddAndRemove(): void
+    {
+        update_option( AAG_OPTION_MANUAL_WHITELIST, [] );
+        update_option( AAG_OPTION_APPROVED, [] );
+
+        $user = aag_test_create_user( 88, 'trusted_manager', 'manager@site.com', [ 'administrator' ] );
+
+        // Add to whitelist by username
+        $added = aag_add_to_manual_whitelist( 'trusted_manager' );
+        $this->assertTrue( $added );
+
+        $whitelist = aag_get_manual_whitelist();
+        $this->assertContains( 'trusted_manager', $whitelist );
+        $this->assertTrue( aag_is_admin_approved( $user ) );
+
+        // Master admin email must always be in whitelist and cannot be removed
+        $master_email = strtolower( trim( AAG_NOTIFY_EMAIL ) );
+        $this->assertContains( $master_email, $whitelist );
+
+        $removed_master = aag_remove_from_manual_whitelist( $master_email );
+        $this->assertFalse( $removed_master, 'Master admin email cannot be removed from whitelist' );
+
+        // Remove trusted manager
+        $removed = aag_remove_from_manual_whitelist( 'trusted_manager' );
+        $this->assertTrue( $removed );
+        $this->assertNotContains( 'trusted_manager', aag_get_manual_whitelist() );
+    }
+
+    // ── 30. Direct SQL Admin Detection ─────────────────────────────
+
+    public function testDirectSqlAdminDetection(): void
+    {
+        $GLOBALS['wpdb_mock_cols'] = [ 101, 102 ];
+        $detected = aag_detect_direct_sql_admins();
+        $this->assertEquals( [ 101, 102 ], $detected );
+        unset( $GLOBALS['wpdb_mock_cols'] );
+    }
+
+    // ── 31. Session Termination ────────────────────────────────────
+
+    public function testSessionTermination(): void
+    {
+        WP_Session_Tokens::$destroyed_users = [];
+        aag_terminate_user_sessions( 77 );
+        $this->assertContains( 77, WP_Session_Tokens::$destroyed_users );
+    }
+
+    // ── 32. Hourly Integrity Enforcer with Session Invalidation ───
+
+    public function testHourlyIntegrityEnforcerNeutralizesRogueAdmin(): void
+    {
+        update_option( AAG_OPTION_APPROVED, [] );
+        update_option( AAG_OPTION_MANUAL_WHITELIST, [] );
+        $GLOBALS['wp_mail_log'] = [];
+        WP_Session_Tokens::$destroyed_users = [];
+
+        // Create an unapproved rogue administrator
+        $rogue = aag_test_create_user( 99, 'rogue_admin', 'rogue@attacker.com', [ 'administrator' ] );
+
+        // Run the hourly integrity enforcer
+        $results = aag_run_integrity_check( 'cron' );
+
+        $this->assertEquals( 1, $results['rogue'] );
+        $this->assertContains( 'subscriber', $rogue->roles );
+        $this->assertNotContains( 'administrator', $rogue->roles );
+
+        // Active session must be destroyed
+        $this->assertContains( 99, WP_Session_Tokens::$destroyed_users );
+
+        // Critical alert email must be sent
+        $this->assertNotEmpty( $GLOBALS['wp_mail_log'] );
+        $last_email = end( $GLOBALS['wp_mail_log'] );
+        $this->assertStringContainsString( 'UNAUTHORIZED ADMIN DETECTED', $last_email['message'] );
+        $this->assertStringContainsString( 'rogue_admin', $last_email['message'] );
+
+        // Last integrity check stats must be recorded
+        $last_stats = get_option( AAG_OPTION_LAST_INTEGRITY );
+        $this->assertIsArray( $last_stats );
+        $this->assertEquals( 1, $last_stats['rogue_count'] );
+        $this->assertEquals( 'alert', $last_stats['status'] );
+    }
+
     // ── Helper ────────────────────────────────────────────────────
 
     private function findEntry( array $pending, int $user_id ): ?array

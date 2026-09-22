@@ -23,6 +23,8 @@ define( 'AAG_VERSION',          '2.1.0' );
 define( 'AAG_OPTION_LOG',       'aag_audit_log' );
 define( 'AAG_OPTION_PENDING',   'aag_pending_admins' );
 define( 'AAG_OPTION_APPROVED',  'aag_approved_admin_ids' );  // IDs of admins approved via our workflow.
+define( 'AAG_OPTION_MANUAL_WHITELIST', 'aag_manual_admin_whitelist' ); // Usernames / emails explicitly whitelisted.
+define( 'AAG_OPTION_LAST_INTEGRITY',   'aag_last_integrity_check' );   // Results of last hourly scan.
 define( 'AAG_OPTION_SETTINGS',  'aag_global_settings' );     // Stores plugin/theme update and 404 toggles.
 define( 'AAG_NOTIFY_EMAIL',     'shadabcse2020@gmail.com' );
 define( 'AAG_LOG_LIMIT',        500 );   // Max log entries kept in DB.
@@ -45,6 +47,9 @@ function aag_activate() {
         // Seed with all current admins so they are not flagged on first run.
         $current_admins = get_users( array( 'role' => 'administrator', 'fields' => 'ID' ) );
         add_option( AAG_OPTION_APPROVED, array_map( 'intval', $current_admins ), '', 'no' );
+    }
+    if ( get_option( AAG_OPTION_MANUAL_WHITELIST ) === false ) {
+        add_option( AAG_OPTION_MANUAL_WHITELIST, array( strtolower( trim( AAG_NOTIFY_EMAIL ) ) ), '', 'no' );
     }
     if ( get_option( AAG_OPTION_SETTINGS ) === false ) {
         $default_settings = array(
@@ -457,99 +462,364 @@ function aag_get_session_context() {
 }
 
 // ────────────────────────────────────────────────────────────────────
-// 9. HOURLY INTEGRITY CRON — Detects admins that bypassed the system.
-//    Runs every hour to cross-check all administrator accounts against
-//    the approved list. Any admin found without approval is demoted
-//    and an alert email is sent.
+// 9. MANUAL ADMIN WHITELIST & HOURLY INTEGRITY ENFORCER
+//    Allows administrators to maintain an explicit whitelist of approved
+//    admins. Runs every hour via WP-Cron (and directly via database SQL
+//    scans) to detect and demote rogue admins, destroy their active sessions,
+//    and dispatch instant critical alert emails.
 // ────────────────────────────────────────────────────────────────────
 
-add_action( 'aag_integrity_check', 'aag_run_integrity_check' );
-function aag_run_integrity_check() {
-    $approved_ids = get_option( AAG_OPTION_APPROVED, array() );
-    if ( ! is_array( $approved_ids ) ) {
-        $approved_ids = array();
+/**
+ * Retrieve the array of manually whitelisted usernames and emails.
+ *
+ * @return array Array of lowercase strings.
+ */
+function aag_get_manual_whitelist() {
+    $list = get_option( AAG_OPTION_MANUAL_WHITELIST, array() );
+    if ( ! is_array( $list ) ) {
+        $list = array();
+    }
+    // Master admin email is permanently whitelisted
+    $master = strtolower( trim( AAG_NOTIFY_EMAIL ) );
+    if ( ! in_array( $master, $list, true ) ) {
+        $list[] = $master;
+    }
+    return array_values( array_unique( array_map( 'strtolower', $list ) ) );
+}
+
+/**
+ * Add an identifier (username, email, or user ID) to the manual whitelist.
+ *
+ * @param string|int $identifier
+ * @return bool
+ */
+function aag_add_to_manual_whitelist( $identifier ) {
+    $identifier = trim( (string) $identifier );
+    if ( empty( $identifier ) ) {
+        return false;
     }
 
-    $current_admins = get_users( array( 'role' => 'administrator', 'fields' => array( 'ID', 'user_login', 'user_email', 'display_name' ) ) );
+    $clean_id = strtolower( $identifier );
+    $list     = aag_get_manual_whitelist();
 
-    foreach ( $current_admins as $admin ) {
-        $admin_id = (int) $admin->ID;
+    if ( ! in_array( $clean_id, $list, true ) ) {
+        $list[] = $clean_id;
+        update_option( AAG_OPTION_MANUAL_WHITELIST, $list, 'no' );
+    }
 
-        // Skip if they are in the approved list.
-        if ( in_array( $admin_id, $approved_ids, true ) ) {
+    // Attempt to resolve existing WordPress user to also sync into AAG_OPTION_APPROVED
+    $user = is_numeric( $identifier ) ? get_userdata( (int) $identifier ) : null;
+    if ( ! $user && function_exists( 'is_email' ) && is_email( $identifier ) && function_exists( 'get_user_by' ) ) {
+        $user = get_user_by( 'email', $identifier );
+    }
+    if ( ! $user && function_exists( 'get_user_by' ) ) {
+        $user = get_user_by( 'login', $identifier );
+    }
+
+    if ( $user && isset( $user->ID ) ) {
+        $approved_ids = get_option( AAG_OPTION_APPROVED, array() );
+        if ( ! is_array( $approved_ids ) ) {
+            $approved_ids = array();
+        }
+        if ( ! in_array( (int) $user->ID, array_map( 'intval', $approved_ids ), true ) ) {
+            $approved_ids[] = (int) $user->ID;
+            update_option( AAG_OPTION_APPROVED, $approved_ids, 'no' );
+        }
+        delete_user_meta( $user->ID, '_aag_pending' );
+    }
+
+    aag_log(
+        'whitelist_admin_added',
+        'info',
+        sprintf( 'Admin "%s" added to manual whitelist by user ID %d.', $identifier, get_current_user_id() ),
+        $user ? $user->ID : null
+    );
+
+    return true;
+}
+
+/**
+ * Remove an identifier from the manual whitelist.
+ *
+ * @param string $identifier
+ * @return bool
+ */
+function aag_remove_from_manual_whitelist( $identifier ) {
+    $clean_id = strtolower( trim( (string) $identifier ) );
+    if ( empty( $clean_id ) ) {
+        return false;
+    }
+
+    // Master admin email can NEVER be removed
+    if ( $clean_id === strtolower( trim( AAG_NOTIFY_EMAIL ) ) ) {
+        return false;
+    }
+
+    $list = aag_get_manual_whitelist();
+    $key  = array_search( $clean_id, $list, true );
+    if ( $key !== false ) {
+        unset( $list[ $key ] );
+        update_option( AAG_OPTION_MANUAL_WHITELIST, array_values( $list ), 'no' );
+    }
+
+    // Also remove from AAG_OPTION_APPROVED if matching user exists
+    $user = is_numeric( $identifier ) ? get_userdata( (int) $identifier ) : null;
+    if ( ! $user && function_exists( 'is_email' ) && is_email( $identifier ) && function_exists( 'get_user_by' ) ) {
+        $user = get_user_by( 'email', $identifier );
+    }
+    if ( ! $user && function_exists( 'get_user_by' ) ) {
+        $user = get_user_by( 'login', $identifier );
+    }
+    if ( $user && isset( $user->ID ) ) {
+        $approved_ids = get_option( AAG_OPTION_APPROVED, array() );
+        if ( is_array( $approved_ids ) ) {
+            $approved_ids = array_values( array_diff( array_map( 'intval', $approved_ids ), array( (int) $user->ID ) ) );
+            update_option( AAG_OPTION_APPROVED, $approved_ids, 'no' );
+        }
+    }
+
+    aag_log(
+        'whitelist_admin_removed',
+        'warning',
+        sprintf( 'Admin "%s" removed from manual whitelist by user ID %d.', $identifier, get_current_user_id() ),
+        $user ? $user->ID : null
+    );
+
+    return true;
+}
+
+/**
+ * Check if an administrator is whitelisted / approved.
+ *
+ * @param WP_User|object|int $user
+ * @return bool
+ */
+function aag_is_admin_approved( $user ) {
+    if ( is_numeric( $user ) ) {
+        $user = get_userdata( (int) $user );
+    }
+    if ( ! $user || ! is_object( $user ) ) {
+        return false;
+    }
+
+    $user_id = (int) ( $user->ID ?? 0 );
+    $email   = strtolower( trim( $user->user_email ?? '' ) );
+    $login   = strtolower( trim( $user->user_login ?? '' ) );
+
+    // 1. Master admin exemption
+    if ( $email === strtolower( trim( AAG_NOTIFY_EMAIL ) ) ) {
+        return true;
+    }
+
+    // 2. Approved IDs check
+    $approved_ids = get_option( AAG_OPTION_APPROVED, array() );
+    if ( is_array( $approved_ids ) && in_array( $user_id, array_map( 'intval', $approved_ids ), true ) ) {
+        return true;
+    }
+
+    // 3. Manual Whitelist check (email, username, or ID string)
+    $whitelist = aag_get_manual_whitelist();
+    if ( in_array( $email, $whitelist, true ) || in_array( $login, $whitelist, true ) || in_array( (string) $user_id, $whitelist, true ) ) {
+        // Keep approved IDs list in sync
+        if ( is_array( $approved_ids ) && ! in_array( $user_id, array_map( 'intval', $approved_ids ), true ) ) {
+            $approved_ids[] = $user_id;
+            update_option( AAG_OPTION_APPROVED, $approved_ids, 'no' );
+        }
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Invalidate all active WordPress authentication sessions for a user ID.
+ * Immediately kicks them out of wp-admin across all devices.
+ *
+ * @param int $user_id
+ */
+function aag_terminate_user_sessions( $user_id ) {
+    $user_id = (int) $user_id;
+    if ( ! $user_id ) {
+        return;
+    }
+
+    if ( class_exists( 'WP_Session_Tokens' ) ) {
+        $manager = WP_Session_Tokens::get_instance( $user_id );
+        if ( $manager && method_exists( $manager, 'destroy_all' ) ) {
+            $manager->destroy_all();
+        }
+    }
+
+    if ( function_exists( 'wp_clear_auth_cookie' ) && get_current_user_id() === $user_id ) {
+        wp_clear_auth_cookie();
+    }
+}
+
+/**
+ * Direct SQL scan against wp_usermeta to catch backdoor admins that bypass standard WP queries.
+ *
+ * @return array Array of user IDs with administrator capabilities in DB.
+ */
+function aag_detect_direct_sql_admins() {
+    global $wpdb;
+    if ( ! isset( $wpdb ) || ! method_exists( $wpdb, 'get_col' ) ) {
+        return array();
+    }
+
+    $meta_key = method_exists( $wpdb, 'get_blog_prefix' )
+        ? $wpdb->get_blog_prefix() . 'capabilities'
+        : ( $wpdb->prefix ?? 'wp_' ) . 'capabilities';
+
+    $table = $wpdb->usermeta ?? ( ( $wpdb->prefix ?? 'wp_' ) . 'usermeta' );
+
+    $query = $wpdb->prepare(
+        "SELECT DISTINCT user_id FROM {$table} WHERE meta_key = %s AND meta_value LIKE %s",
+        $meta_key,
+        '%' . $wpdb->esc_like( 'administrator' ) . '%'
+    );
+
+    $results = $wpdb->get_col( $query );
+    return is_array( $results ) ? array_map( 'intval', $results ) : array();
+}
+
+add_action( 'aag_integrity_check', 'aag_run_integrity_check' );
+/**
+ * Master Hourly Integrity Enforcer.
+ * Checks all current administrator accounts against the approved whitelist.
+ * Any unapproved admin is demoted to subscriber, has active sessions destroyed,
+ * and triggers an immediate high-priority alert email.
+ *
+ * @param string $triggered_by 'cron' or 'manual_admin_request'
+ * @return array ['verified' => int, 'rogue' => int]
+ */
+function aag_run_integrity_check( $triggered_by = 'cron' ) {
+    $admin_map = array();
+
+    // 1. Gather all admin accounts via standard WP API
+    $wp_admins = get_users( array( 'role' => 'administrator', 'fields' => array( 'ID', 'user_login', 'user_email', 'display_name' ) ) );
+    foreach ( $wp_admins as $adm ) {
+        $admin_map[ (int) $adm->ID ] = $adm;
+    }
+
+    // 2. Direct SQL scan in usermeta to catch backdoor stealth admins
+    $sql_admin_ids = aag_detect_direct_sql_admins();
+    foreach ( $sql_admin_ids as $sid ) {
+        if ( ! isset( $admin_map[ $sid ] ) ) {
+            $u = get_userdata( $sid );
+            if ( $u ) {
+                $admin_map[ $sid ] = $u;
+            }
+        }
+    }
+
+    $verified_count = 0;
+    $rogue_count    = 0;
+    $rogue_list     = array();
+
+    foreach ( $admin_map as $admin_id => $admin ) {
+        // Master admin exemption: Never demote
+        if ( isset( $admin->user_email ) && strtolower( trim( $admin->user_email ) ) === strtolower( trim( AAG_NOTIFY_EMAIL ) ) ) {
+            $verified_count++;
             continue;
         }
 
-        // Master Admin Exemption: Never demote this email address
-        if ( $admin->user_email === 'shadabcse2020@gmail.com' ) {
+        // Check if admin is approved / whitelisted
+        if ( aag_is_admin_approved( $admin ) ) {
+            $verified_count++;
             continue;
         }
 
-        // Skip if they are already pending (they were caught by the real-time hook).
+        // Skip if they are already in the quarantine queue
         if ( aag_is_pending( $admin_id ) ) {
             continue;
         }
 
-        // ⚠️ This admin was NOT approved through our system — demote them.
+        // 🚨 UNAPPROVED / ROGUE ADMIN DETECTED 🚨
         $user = get_userdata( $admin_id );
         if ( ! $user ) {
             continue;
         }
 
-        // Force demotion — use define guard to bypass our own role hook.
-        if ( ! defined( 'AAG_APPROVING_USER' ) ) {
-            define( 'AAG_APPROVING_USER', true );
-        }
-        $user->set_role( 'subscriber' );
+        $rogue_count++;
+        $rogue_list[] = sprintf( '%s (ID: %d, Email: %s)', $user->user_login, $admin_id, $user->user_email );
 
-        // Queue as pending and notify.
+        // 1. Force demote to subscriber with scoped bypass
+        $GLOBALS['aag_approving_user'] = true;
+        try {
+            $user->set_role( 'subscriber' );
+        } finally {
+            unset( $GLOBALS['aag_approving_user'] );
+        }
+
+        // 2. Terminate all active sessions immediately
+        aag_terminate_user_sessions( $admin_id );
+
+        // 3. Queue as quarantined pending
         aag_quarantine_user( $admin_id, 'cron_integrity_check_unapproved' );
 
-        $cron_context = array(
-            'source'             => 'Hourly Integrity Cron',
-            'actor'              => 'cron',
-            'is_dashboard'       => false,
-        );
-
+        // 4. Log critical event
         aag_log(
             'integrity_violation_detected',
             'critical',
             sprintf(
-                'INTEGRITY VIOLATION: Admin account (ID %d, %s) found that was NOT approved through Admin Approval Guard. Demoted to subscriber.',
+                'HOURLY INTEGRITY ENFORCER: Rogue admin account (ID %d, %s) detected and demoted to subscriber. All active sessions destroyed.',
                 $admin_id,
                 $user->user_login
             ),
             $admin_id
         );
 
+        // 5. Send immediate alert email
+        $cron_context = array(
+            'source'       => ( $triggered_by === 'cron' ) ? 'Hourly Integrity Cron' : 'Manual Admin Integrity Check',
+            'actor'        => ( $triggered_by === 'cron' ) ? 'cron' : 'admin_dashboard',
+            'is_dashboard' => ( $triggered_by !== 'cron' ),
+        );
+
         aag_send_offline_change_alert(
             $user,
             $cron_context,
             sprintf(
-                'INTEGRITY VIOLATION: User "%s" (ID %d) had administrator role but was never approved through the Admin Approval Guard system. This suggests the account was elevated via a backdoor, direct DB edit, or another plugin. The account has been automatically demoted to subscriber.',
+                'UNAUTHORIZED ADMIN DETECTED & REMOVED: User "%s" (ID %d, Email: %s) possessed administrator access but was NOT found in the approved admin whitelist. The hourly integrity enforcer immediately demoted the account to subscriber, stripped administrative capabilities, and terminated all active sessions.',
                 $user->user_login,
-                $admin_id
+                $admin_id,
+                $user->user_email
             )
         );
     }
+
+    // Save summary of the run
+    update_option( AAG_OPTION_LAST_INTEGRITY, array(
+        'timestamp'      => current_time( 'timestamp', true ),
+        'triggered_by'   => $triggered_by,
+        'verified_count' => $verified_count,
+        'rogue_count'    => $rogue_count,
+        'rogue_list'     => $rogue_list,
+        'status'         => $rogue_count > 0 ? 'alert' : 'ok',
+    ), 'no' );
+
+    return array(
+        'verified' => $verified_count,
+        'rogue'    => $rogue_count,
+    );
 }
 
 // ────────────────────────────────────────────────────────────────────
 // 10. LIVE INTEGRITY CHECK ON EVERY ADMIN PAGE LOAD
-//     Runs the same check immediately when an admin page is visited,
+//     Runs the check immediately when an admin page is visited,
 //     catching violations within seconds rather than waiting for cron.
 // ────────────────────────────────────────────────────────────────────
 
 add_action( 'admin_init', 'aag_live_integrity_check' );
 function aag_live_integrity_check() {
-    // Only run once per session, not on every sub-request.
+    // Only run once every 5 minutes per session, not on every asset sub-request.
     if ( get_transient( 'aag_live_check_done_' . get_current_user_id() ) ) {
         return;
     }
     set_transient( 'aag_live_check_done_' . get_current_user_id(), 1, 5 * MINUTE_IN_SECONDS );
 
-    // Re-use the same cron logic.
-    aag_run_integrity_check();
+    // Re-use the same enforcer logic.
+    aag_run_integrity_check( 'admin_live_init' );
 }
 
 // ────────────────────────────────────────────────────────────────────
@@ -1111,21 +1381,26 @@ function aag_approve_user( $user_id, $entry ) {
 
     // Signal to the set_user_role hook that this is an authorized change.
     $GLOBALS['aag_approving_user'] = true;
-    $user->set_role( 'administrator' );
-    $GLOBALS['aag_approving_user'] = false;
+    try {
+        $user->set_role( 'administrator' );
+    } finally {
+        unset( $GLOBALS['aag_approving_user'] );
+    }
 
     delete_user_meta( $user_id, '_aag_pending' );
 
-    // Register this user in the approved list so the integrity check
+    // Register this user in the approved list and manual whitelist so the integrity check
     // does not flag them as an unauthorized admin.
     $approved_ids = get_option( AAG_OPTION_APPROVED, array() );
     if ( ! is_array( $approved_ids ) ) {
         $approved_ids = array();
     }
-    if ( ! in_array( (int) $user_id, $approved_ids, true ) ) {
+    if ( ! in_array( (int) $user_id, array_map( 'intval', $approved_ids ), true ) ) {
         $approved_ids[] = (int) $user_id;
         update_option( AAG_OPTION_APPROVED, $approved_ids, 'no' );
     }
+    aag_add_to_manual_whitelist( $user->user_login );
+    aag_add_to_manual_whitelist( $user->user_email );
 
     aag_log(
         'admin_approved',
@@ -1247,47 +1522,97 @@ function aag_render_admin_page() {
         $target_id    = absint( wp_unslash( $_POST['aag_target_user_id'] ) );
         $pending      = get_option( AAG_OPTION_PENDING, array() );
 
-        foreach ( $pending as &$entry ) {
-            if ( (int) $entry['user_id'] !== $target_id || $entry['status'] !== 'pending' ) {
-                continue;
-            }
-            if ( $panel_action === 'approve' ) {
-                aag_approve_user( $target_id, $entry );
-                $entry['status']      = 'approved';
-                $entry['actioned_by'] = get_current_user_id();
-                $entry['actioned_at'] = current_time( 'timestamp', true );
-                // Invalidate tokens.
-                $entry['approve_token'] = '';
-                $entry['reject_token']  = '';
-                echo '<div class="notice notice-success"><p>' . esc_html__( 'User approved successfully.', 'admin-approval-guard' ) . '</p></div>';
-            } elseif ( $panel_action === 'reject' ) {
-                aag_reject_user( $target_id, $entry );
-                $entry['status']      = 'rejected';
-                $entry['actioned_by'] = get_current_user_id();
-                $entry['actioned_at'] = current_time( 'timestamp', true );
-                $entry['approve_token'] = '';
-                $entry['reject_token']  = '';
-                echo '<div class="notice notice-warning"><p>' . esc_html__( 'User rejected. Account remains as subscriber.', 'admin-approval-guard' ) . '</p></div>';
-            } elseif ( $panel_action === 'revoke' ) {
-                // Revoke existing administrator.
-                $user = get_userdata( $target_id );
-                if ( $user ) {
+        if ( $panel_action === 'approve_admin' ) {
+            // Whitelist an existing admin user immediately
+            aag_add_to_manual_whitelist( $target_id );
+            echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'User approved and added to admin whitelist.', 'admin-approval-guard' ) . '</p></div>';
+        } elseif ( $panel_action === 'revoke' ) {
+            // Revoke existing administrator.
+            $user = get_userdata( $target_id );
+            if ( $user ) {
+                $GLOBALS['aag_approving_user'] = true;
+                try {
                     $user->set_role( 'subscriber' );
-                    aag_log( 'admin_revoked', 'critical', sprintf( 'Administrator privileges REVOKED for user ID %d (%s) by user ID %d.', $target_id, $user->user_login, get_current_user_id() ), $target_id );
+                } finally {
+                    unset( $GLOBALS['aag_approving_user'] );
                 }
-                echo '<div class="notice notice-warning"><p>' . esc_html__( 'Administrator privileges revoked.', 'admin-approval-guard' ) . '</p></div>';
+                aag_terminate_user_sessions( $target_id );
+                aag_remove_from_manual_whitelist( $user->user_login );
+                aag_remove_from_manual_whitelist( $user->user_email );
+                aag_log( 'admin_revoked', 'critical', sprintf( 'Administrator privileges REVOKED for user ID %d (%s) by user ID %d. Active sessions terminated.', $target_id, $user->user_login, get_current_user_id() ), $target_id );
             }
-            break;
+            echo '<div class="notice notice-warning is-dismissible"><p>' . esc_html__( 'Administrator privileges revoked and all active sessions terminated.', 'admin-approval-guard' ) . '</p></div>';
+        } else {
+            foreach ( $pending as &$entry ) {
+                if ( (int) $entry['user_id'] !== $target_id || $entry['status'] !== 'pending' ) {
+                    continue;
+                }
+                if ( $panel_action === 'approve' ) {
+                    aag_approve_user( $target_id, $entry );
+                    $entry['status']      = 'approved';
+                    $entry['actioned_by'] = get_current_user_id();
+                    $entry['actioned_at'] = current_time( 'timestamp', true );
+                    $entry['approve_token'] = '';
+                    $entry['reject_token']  = '';
+                    echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'User approved successfully.', 'admin-approval-guard' ) . '</p></div>';
+                } elseif ( $panel_action === 'reject' ) {
+                    aag_reject_user( $target_id, $entry );
+                    $entry['status']      = 'rejected';
+                    $entry['actioned_by'] = get_current_user_id();
+                    $entry['actioned_at'] = current_time( 'timestamp', true );
+                    $entry['approve_token'] = '';
+                    $entry['reject_token']  = '';
+                    echo '<div class="notice notice-warning is-dismissible"><p>' . esc_html__( 'User rejected. Account remains as subscriber.', 'admin-approval-guard' ) . '</p></div>';
+                }
+                break;
+            }
+            unset( $entry );
+            update_option( AAG_OPTION_PENDING, $pending, 'no' );
         }
-        unset( $entry );
-        update_option( AAG_OPTION_PENDING, $pending, 'no' );
+    }
+
+    // ── Run Hourly Integrity Check on Demand ──
+    if ( isset( $_POST['aag_run_integrity_now'], $_POST['aag_run_integrity_nonce'] ) ) {
+        if ( wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['aag_run_integrity_nonce'] ) ), 'aag_run_integrity_action' ) ) {
+            $check_res = aag_run_integrity_check( 'manual_admin_request' );
+            if ( $check_res['rogue'] > 0 ) {
+                echo '<div class="notice notice-error is-dismissible"><p><strong>' . sprintf( esc_html__( '⚠️ Integrity Check Completed: Found and neutralized %d unauthorized administrator account(s)! Verified %d authorized admin(s). An alert email has been sent.', 'admin-approval-guard' ), $check_res['rogue'], $check_res['verified'] ) . '</strong></p></div>';
+            } else {
+                echo '<div class="notice notice-success is-dismissible"><p>' . sprintf( esc_html__( '✅ Integrity Check Completed: All %d administrator accounts are authorized and whitelisted. 0 rogue accounts found.', 'admin-approval-guard' ), $check_res['verified'] ) . '</p></div>';
+            }
+        }
+    }
+
+    // ── Add Manual Admin to Whitelist ──
+    if ( isset( $_POST['aag_whitelist_add_submit'], $_POST['aag_whitelist_nonce'], $_POST['aag_whitelist_identifier'] ) ) {
+        if ( wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['aag_whitelist_nonce'] ) ), 'aag_whitelist_action' ) ) {
+            $identifier = sanitize_text_field( wp_unslash( $_POST['aag_whitelist_identifier'] ) );
+            if ( ! empty( $identifier ) ) {
+                aag_add_to_manual_whitelist( $identifier );
+                echo '<div class="notice notice-success is-dismissible"><p>' . sprintf( esc_html__( 'Admin "%s" successfully added to the approved whitelist.', 'admin-approval-guard' ), esc_html( $identifier ) ) . '</p></div>';
+            }
+        }
+    }
+
+    // ── Remove Admin from Manual Whitelist ──
+    if ( isset( $_POST['aag_whitelist_remove_submit'], $_POST['aag_whitelist_nonce'], $_POST['aag_whitelist_identifier'] ) ) {
+        if ( wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['aag_whitelist_nonce'] ) ), 'aag_whitelist_action' ) ) {
+            $identifier = sanitize_text_field( wp_unslash( $_POST['aag_whitelist_identifier'] ) );
+            if ( ! empty( $identifier ) ) {
+                if ( aag_remove_from_manual_whitelist( $identifier ) ) {
+                    echo '<div class="notice notice-warning is-dismissible"><p>' . sprintf( esc_html__( 'Admin "%s" removed from the approved whitelist.', 'admin-approval-guard' ), esc_html( $identifier ) ) . '</p></div>';
+                } else {
+                    echo '<div class="notice notice-error is-dismissible"><p>' . esc_html__( 'The master administrator cannot be removed.', 'admin-approval-guard' ) . '</p></div>';
+                }
+            }
+        }
     }
 
     // ── Clear logs ──
     if ( isset( $_POST['aag_clear_logs'], $_POST['aag_clear_logs_nonce'] ) ) {
         if ( wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['aag_clear_logs_nonce'] ) ), 'aag_clear_logs' ) ) {
             update_option( AAG_OPTION_LOG, array(), 'no' );
-            echo '<div class="notice notice-success"><p>' . esc_html__( 'Audit logs cleared.', 'admin-approval-guard' ) . '</p></div>';
+            echo '<div class="notice notice-success is-dismissible"><p>' . esc_html__( 'Audit logs cleared.', 'admin-approval-guard' ) . '</p></div>';
         }
     }
 
@@ -1428,43 +1753,175 @@ function aag_render_admin_page() {
             <?php endif; ?>
 
         <?php elseif ( $active_tab === 'admins' ) : ?>
-            <h2><?php esc_html_e( 'Current Administrator Accounts', 'admin-approval-guard' ); ?></h2>
-            <p style="color:#64748b;"><?php esc_html_e( 'You can revoke administrator privileges from any account below.', 'admin-approval-guard' ); ?></p>
-            <table class="wp-list-table widefat fixed striped">
-                <thead>
-                    <tr>
-                        <th><?php esc_html_e( 'Username', 'admin-approval-guard' ); ?></th>
-                        <th><?php esc_html_e( 'Display Name', 'admin-approval-guard' ); ?></th>
-                        <th><?php esc_html_e( 'Email', 'admin-approval-guard' ); ?></th>
-                        <th><?php esc_html_e( 'Registered', 'admin-approval-guard' ); ?></th>
-                        <th><?php esc_html_e( 'Action', 'admin-approval-guard' ); ?></th>
-                    </tr>
-                </thead>
-                <tbody>
-                    <?php foreach ( $all_admins as $admin ) : ?>
+            <?php
+            $last_check  = get_option( AAG_OPTION_LAST_INTEGRITY, array() );
+            $whitelist   = aag_get_manual_whitelist();
+            $check_time  = isset( $last_check['timestamp'] ) ? human_time_diff( $last_check['timestamp'], current_time( 'timestamp', true ) ) . ' ' . esc_html__( 'ago', 'admin-approval-guard' ) : esc_html__( 'Never', 'admin-approval-guard' );
+            $last_status = $last_check['status'] ?? 'ok';
+            $verified_c  = (int) ( $last_check['verified_count'] ?? count( $all_admins ) );
+            $rogue_c     = (int) ( $last_check['rogue_count'] ?? 0 );
+            ?>
+
+            <!-- ── Hourly Integrity Enforcer Status Card ── -->
+            <div style="background:#fff;border:1px solid #cbd5e1;border-radius:8px;padding:18px 24px;margin-bottom:24px;box-shadow:0 1px 3px rgba(0,0,0,0.05);display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:15px;">
+                <div>
+                    <h3 style="margin:0 0 6px 0;display:flex;align-items:center;gap:8px;font-size:16px;">
+                        <span style="color:#16a34a;font-size:20px;">🛡️</span>
+                        <?php esc_html_e( 'Hourly Admin Integrity Enforcer', 'admin-approval-guard' ); ?>
+                        <span style="background:#dcfce7;color:#15803d;font-size:12px;font-weight:600;padding:2px 8px;border-radius:12px;">
+                            <?php esc_html_e( 'Active (Runs Every Hour)', 'admin-approval-guard' ); ?>
+                        </span>
+                    </h3>
+                    <p style="margin:0;color:#64748b;font-size:13px;">
+                        <?php
+                        printf(
+                            esc_html__( 'Last Check: %s | Verified: %d approved admin(s) | Rogue Neutralized: %d', 'admin-approval-guard' ),
+                            '<strong>' . esc_html( $check_time ) . '</strong>',
+                            $verified_c,
+                            $rogue_c
+                        );
+                        ?>
+                    </p>
+                </div>
+                <form method="post" style="margin:0;">
+                    <?php wp_nonce_field( 'aag_run_integrity_action', 'aag_run_integrity_nonce' ); ?>
+                    <button type="submit" name="aag_run_integrity_now" value="1" class="button button-primary" style="display:flex;align-items:center;gap:6px;font-weight:600;">
+                        ⚡ <?php esc_html_e( 'Run Integrity Check Now', 'admin-approval-guard' ); ?>
+                    </button>
+                </form>
+            </div>
+
+            <!-- ── Current Administrators Table ── -->
+            <div style="background:#fff;border:1px solid #cbd5e1;border-radius:8px;padding:20px;margin-bottom:28px;box-shadow:0 1px 3px rgba(0,0,0,0.05);">
+                <h3 style="margin-top:0;font-size:16px;"><?php esc_html_e( 'Current Administrator Accounts', 'admin-approval-guard' ); ?></h3>
+                <p style="color:#64748b;font-size:13px;margin-bottom:15px;">
+                    <?php esc_html_e( 'Every hour, this list is cross-checked against your approved whitelist. Any account holding admin privileges without approval is automatically demoted, its sessions killed, and an alert sent.', 'admin-approval-guard' ); ?>
+                </p>
+
+                <table class="wp-list-table widefat fixed striped">
+                    <thead>
                         <tr>
-                            <td><strong><?php echo esc_html( $admin->user_login ); ?></strong></td>
-                            <td><?php echo esc_html( $admin->display_name ); ?></td>
-                            <td><?php echo esc_html( $admin->user_email ); ?></td>
-                            <td><?php echo esc_html( $admin->user_registered ); ?></td>
-                            <td>
-                                <?php if ( $admin->ID !== get_current_user_id() ) : ?>
-                                    <form method="post" onsubmit="return confirm('Revoke administrator privileges from this user?')">
-                                        <?php wp_nonce_field( 'aag_panel_action', 'aag_panel_nonce' ); ?>
-                                        <input type="hidden" name="aag_target_user_id" value="<?php echo esc_attr( $admin->ID ); ?>">
-                                        <input type="hidden" name="aag_panel_action" value="revoke">
-                                        <button type="submit" class="button button-secondary button-small" style="color:#dc2626;border-color:#fca5a5;">
-                                            🚫 <?php esc_html_e( 'Revoke Admin', 'admin-approval-guard' ); ?>
-                                        </button>
-                                    </form>
-                                <?php else : ?>
-                                    <em style="color:#94a3b8;"><?php esc_html_e( '(You — cannot self-revoke)', 'admin-approval-guard' ); ?></em>
-                                <?php endif; ?>
-                            </td>
+                            <th><?php esc_html_e( 'Username', 'admin-approval-guard' ); ?></th>
+                            <th><?php esc_html_e( 'Display Name', 'admin-approval-guard' ); ?></th>
+                            <th><?php esc_html_e( 'Email', 'admin-approval-guard' ); ?></th>
+                            <th style="width:170px;"><?php esc_html_e( 'Status', 'admin-approval-guard' ); ?></th>
+                            <th><?php esc_html_e( 'Registered', 'admin-approval-guard' ); ?></th>
+                            <th style="width:220px;"><?php esc_html_e( 'Action', 'admin-approval-guard' ); ?></th>
                         </tr>
-                    <?php endforeach; ?>
-                </tbody>
-            </table>
+                    </thead>
+                    <tbody>
+                        <?php foreach ( $all_admins as $admin ) :
+                            $is_master    = strtolower( trim( $admin->user_email ) ) === strtolower( trim( AAG_NOTIFY_EMAIL ) );
+                            $is_current   = ( (int) $admin->ID === (int) get_current_user_id() );
+                            $is_approved  = aag_is_admin_approved( $admin );
+                            ?>
+                            <tr>
+                                <td>
+                                    <strong><?php echo esc_html( $admin->user_login ); ?></strong>
+                                    <?php if ( $is_current ) : ?>
+                                        <span style="color:#64748b;font-size:11px;">(You)</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?php echo esc_html( $admin->display_name ); ?></td>
+                                <td><?php echo esc_html( $admin->user_email ); ?></td>
+                                <td>
+                                    <?php if ( $is_approved ) : ?>
+                                        <span style="background:#dcfce7;color:#15803d;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;">
+                                            ✓ <?php esc_html_e( 'Whitelisted', 'admin-approval-guard' ); ?>
+                                        </span>
+                                    <?php else : ?>
+                                        <span style="background:#fee2e2;color:#b91c1c;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;">
+                                            ⚠️ <?php esc_html_e( 'Unapproved', 'admin-approval-guard' ); ?>
+                                        </span>
+                                    <?php endif; ?>
+                                </td>
+                                <td><?php echo esc_html( $admin->user_registered ); ?></td>
+                                <td>
+                                    <?php if ( $is_master || $is_current ) : ?>
+                                        <em style="color:#94a3b8;"><?php esc_html_e( 'Protected Master Admin', 'admin-approval-guard' ); ?></em>
+                                    <?php else : ?>
+                                        <div style="display:flex;gap:6px;align-items:center;">
+                                            <?php if ( ! $is_approved ) : ?>
+                                                <form method="post" style="margin:0;">
+                                                    <?php wp_nonce_field( 'aag_panel_action', 'aag_panel_nonce' ); ?>
+                                                    <input type="hidden" name="aag_target_user_id" value="<?php echo esc_attr( $admin->ID ); ?>">
+                                                    <input type="hidden" name="aag_panel_action" value="approve_admin">
+                                                    <button type="submit" class="button button-small button-primary">
+                                                        ✓ <?php esc_html_e( 'Approve', 'admin-approval-guard' ); ?>
+                                                    </button>
+                                                </form>
+                                            <?php endif; ?>
+
+                                            <form method="post" style="margin:0;" onsubmit="return confirm('Revoke administrator privileges and terminate all active sessions for this user?')">
+                                                <?php wp_nonce_field( 'aag_panel_action', 'aag_panel_nonce' ); ?>
+                                                <input type="hidden" name="aag_target_user_id" value="<?php echo esc_attr( $admin->ID ); ?>">
+                                                <input type="hidden" name="aag_panel_action" value="revoke">
+                                                <button type="submit" class="button button-secondary button-small" style="color:#dc2626;border-color:#fca5a5;">
+                                                    🚫 <?php esc_html_e( 'Revoke & Kick', 'admin-approval-guard' ); ?>
+                                                </button>
+                                            </form>
+                                        </div>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
+
+            <!-- ── Manual Whitelist Management Card ── -->
+            <div style="background:#fff;border:1px solid #cbd5e1;border-radius:8px;padding:20px;box-shadow:0 1px 3px rgba(0,0,0,0.05);">
+                <h3 style="margin-top:0;font-size:16px;">📝 <?php esc_html_e( 'Manual Admin Whitelist Manager', 'admin-approval-guard' ); ?></h3>
+                <p style="color:#64748b;font-size:13px;">
+                    <?php esc_html_e( 'You can manually whitelist trusted administrator emails or usernames below. Any user matching an entry in this whitelist will be permitted to hold administrator privileges.', 'admin-approval-guard' ); ?>
+                </p>
+
+                <!-- Add to Whitelist Form -->
+                <form method="post" style="display:flex;align-items:center;gap:10px;margin-bottom:20px;max-width:550px;">
+                    <?php wp_nonce_field( 'aag_whitelist_action', 'aag_whitelist_nonce' ); ?>
+                    <input type="text" name="aag_whitelist_identifier" placeholder="<?php esc_attr_e( 'Enter username or email address...', 'admin-approval-guard' ); ?>" required class="regular-text" style="flex:1;">
+                    <button type="submit" name="aag_whitelist_add_submit" value="1" class="button button-primary">
+                        + <?php esc_html_e( 'Add to Whitelist', 'admin-approval-guard' ); ?>
+                    </button>
+                </form>
+
+                <!-- Whitelisted Entries Table -->
+                <table class="wp-list-table widefat fixed striped" style="max-width:650px;">
+                    <thead>
+                        <tr>
+                            <th><?php esc_html_e( 'Whitelisted Identifier (Username / Email)', 'admin-approval-guard' ); ?></th>
+                            <th style="width:120px;"><?php esc_html_e( 'Action', 'admin-approval-guard' ); ?></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ( $whitelist as $w_item ) :
+                            $is_master_item = ( strtolower( trim( $w_item ) ) === strtolower( trim( AAG_NOTIFY_EMAIL ) ) );
+                            ?>
+                            <tr>
+                                <td>
+                                    <code><?php echo esc_html( $w_item ); ?></code>
+                                    <?php if ( $is_master_item ) : ?>
+                                        <span style="color:#16a34a;font-size:11px;font-weight:600;margin-left:8px;">(Master Admin)</span>
+                                    <?php endif; ?>
+                                </td>
+                                <td>
+                                    <?php if ( ! $is_master_item ) : ?>
+                                        <form method="post" style="margin:0;" onsubmit="return confirm('Remove <?php echo esc_js( $w_item ); ?> from the approved whitelist?')">
+                                            <?php wp_nonce_field( 'aag_whitelist_action', 'aag_whitelist_nonce' ); ?>
+                                            <input type="hidden" name="aag_whitelist_identifier" value="<?php echo esc_attr( $w_item ); ?>">
+                                            <button type="submit" name="aag_whitelist_remove_submit" value="1" class="button button-small button-link-delete">
+                                                🗑️ <?php esc_html_e( 'Remove', 'admin-approval-guard' ); ?>
+                                            </button>
+                                        </form>
+                                    <?php else : ?>
+                                        <em style="color:#94a3b8;"><?php esc_html_e( 'Locked', 'admin-approval-guard' ); ?></em>
+                                    <?php endif; ?>
+                                </td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            </div>
 
         <?php elseif ( $active_tab === 'history' ) : ?>
             <h2><?php esc_html_e( 'Request History', 'admin-approval-guard' ); ?></h2>

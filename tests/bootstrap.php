@@ -21,10 +21,13 @@ $GLOBALS['wp_mail_log'] = [];   // captured wp_mail calls
 
 class WPDB_Mock {
     public string $prefix = 'wp_';
+    public string $usermeta = 'wp_usermeta';
     public function get_charset_collate(): string { return 'DEFAULT CHARSET=utf8mb4'; }
+    public function get_blog_prefix( $blog_id = 0 ): string { return $this->prefix; }
     public function get_var( $query = null, $x = 0, $y = 0 ) { return null; }
     public function get_row( $query = null, $output = 'OBJECT', $y = 0 ) { return null; }
     public function get_results( $query = null, $output = 'OBJECT' ) { return []; }
+    public function get_col( $query = null, $x = 0 ) { return $GLOBALS['wpdb_mock_cols'] ?? []; }
     public function query( $query ) { return true; }
     public function prepare( $query, ...$args ) {
         if ( empty( $args ) ) return $query;
@@ -115,6 +118,35 @@ class WP_User_Mock {
 
 function get_userdata( $id ) {
     return $GLOBALS['wp_users'][ (int) $id ] ?? false;
+}
+
+function get_user_by( $field, $value ) {
+    foreach ( $GLOBALS['wp_users'] as $u ) {
+        if ( $field === 'id' && (int) $u->ID === (int) $value ) return $u;
+        if ( $field === 'login' && strtolower( $u->user_login ) === strtolower( (string) $value ) ) return $u;
+        if ( $field === 'email' && strtolower( $u->user_email ) === strtolower( (string) $value ) ) return $u;
+    }
+    return false;
+}
+
+function is_email( $email ) {
+    return filter_var( $email, FILTER_VALIDATE_EMAIL ) ? (string) $email : false;
+}
+
+if ( ! class_exists( 'WP_Session_Tokens' ) ) {
+    class WP_Session_Tokens {
+        public static array $destroyed_users = [];
+        public int $user_id;
+        public function __construct( int $user_id ) {
+            $this->user_id = $user_id;
+        }
+        public static function get_instance( int $user_id ) {
+            return new self( $user_id );
+        }
+        public function destroy_all() {
+            self::$destroyed_users[] = $this->user_id;
+        }
+    }
 }
 
 function get_users( array $args = [] ) {
