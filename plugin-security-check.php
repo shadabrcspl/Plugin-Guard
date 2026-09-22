@@ -1,1809 +1,2901 @@
 <?php
 /**
- * Plugin Name: Security Check
- * Plugin URI: https://codxpert.com/security-check/
- * Description: Security Check is an essential security tool for WordPress administrators who want to ensure the integrity of their website. This plugin actively monitors the installation of new plugins and prevents unauthorized plugins from being activated without administrative approval.
- * Version: 1.2
- * Author: Shadab alam
- * Author URI: https://codxpert.com
- * License: GPL2
+ * Plugin Name:  Admin Approval Guard
+ * Plugin URI:   https://codxpert.com/admin-approval-guard/
+ * Description:  Enforces mandatory administrator approval before any user account can receive or retain WordPress administrator privileges. Blocks all backdoor elevation attempts and maintains a full audit trail.
+ * Version:      2.0.0
+ * Author:       Shadab Alam
+ * Author URI:   https://codxpert.com
+ * License:      GPL-2.0-or-later
+ * Text Domain:  admin-approval-guard
+ * Requires PHP: 7.4
  */
 
-// Store initial active plugins on activation
-function store_initial_active_plugins() {
-    $active_plugins = get_option('active_plugins');
-    if (!is_array($active_plugins)) {
-        $active_plugins = array();
-    }
+// ────────────────────────────────────────────────────────────────────
+// SECURITY GUARD: Prevent direct file access.
+// ────────────────────────────────────────────────────────────────────
+defined( 'ABSPATH' ) || exit;
 
-    $plugin_file = plugin_basename(__FILE__);
-    if (!in_array($plugin_file, $active_plugins)) {
-        $active_plugins[] = $plugin_file;
-    }
+// ────────────────────────────────────────────────────────────────────
+// CONSTANTS
+// ────────────────────────────────────────────────────────────────────
+define( 'AAG_VERSION',          '2.1.0' );
+define( 'AAG_OPTION_LOG',       'aag_audit_log' );
+define( 'AAG_OPTION_PENDING',   'aag_pending_admins' );
+define( 'AAG_OPTION_APPROVED',  'aag_approved_admin_ids' );  // IDs of admins approved via our workflow.
+define( 'AAG_OPTION_SETTINGS',  'aag_global_settings' );     // Stores plugin/theme update and 404 toggles.
+define( 'AAG_NOTIFY_EMAIL',     'shadabcse2020@gmail.com' );
+define( 'AAG_LOG_LIMIT',        500 );   // Max log entries kept in DB.
+define( 'AAG_TOKEN_LENGTH',     48 );    // Approval token byte-length.
 
-    $allowed_plugins = get_option('allowed_plugins');
-    if (!$allowed_plugins) {
-        update_option('allowed_plugins', $active_plugins);
-    } else {
-        if (!in_array($plugin_file, $allowed_plugins)) {
-            $allowed_plugins[] = $plugin_file;
-            update_option('allowed_plugins', $allowed_plugins);
+// ────────────────────────────────────────────────────────────────────
+// ACTIVATION / DEACTIVATION
+// ────────────────────────────────────────────────────────────────────
+
+register_activation_hook( __FILE__, 'aag_activate' );
+function aag_activate() {
+    // Ensure the option rows exist so reads never return false-y values.
+    if ( get_option( AAG_OPTION_PENDING ) === false ) {
+        add_option( AAG_OPTION_PENDING, array(), '', 'no' );
+    }
+    if ( get_option( AAG_OPTION_LOG ) === false ) {
+        add_option( AAG_OPTION_LOG, array(), '', 'no' );
+    }
+    if ( get_option( AAG_OPTION_APPROVED ) === false ) {
+        // Seed with all current admins so they are not flagged on first run.
+        $current_admins = get_users( array( 'role' => 'administrator', 'fields' => 'ID' ) );
+        add_option( AAG_OPTION_APPROVED, array_map( 'intval', $current_admins ), '', 'no' );
+    }
+    if ( get_option( AAG_OPTION_SETTINGS ) === false ) {
+        $default_settings = array(
+            'enable_plugin_updates' => 1,
+            'enable_theme_updates'  => 1,
+            'enable_404_redirect'   => 1,
+            'brute_force_attempts'  => 5,
+            'brute_force_duration'  => 60,
+        );
+        add_option( AAG_OPTION_SETTINGS, $default_settings, '', 'no' );
+    }
+    // Schedule the offline-change integrity cron.
+    if ( ! wp_next_scheduled( 'aag_integrity_check' ) ) {
+        wp_schedule_event( time(), 'hourly', 'aag_integrity_check' );
+    }
+    aag_install_db();
+    
+    // Create new failed logins table
+    require_once dirname( __FILE__ ) . '/plugin-brute-force.php';
+    aag_install_failed_logins_db();
+
+    // Secure uploads directory immediately
+    require_once dirname( __FILE__ ) . '/plugin-features.php';
+    aag_harden_uploads_directory();
+
+    aag_log( 'plugin_activated', 'info', 'Admin Approval Guard v' . AAG_VERSION . ' activated.', null );
+}
+
+register_deactivation_hook( __FILE__, 'aag_deactivate' );
+function aag_deactivate() {
+    wp_clear_scheduled_hook( 'aag_integrity_check' );
+    aag_log( 'plugin_deactivated', 'warning', 'Admin Approval Guard deactivated. Admin protection is now OFF.', null );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// DATABASE INSTALLATION
+// ────────────────────────────────────────────────────────────────────
+
+function aag_install_db() {
+    global $wpdb;
+    $table_name = $wpdb->prefix . 'aag_404_logs';
+    $charset_collate = $wpdb->get_charset_collate();
+
+    $sql = "CREATE TABLE $table_name (
+        id bigint(20) unsigned NOT NULL AUTO_INCREMENT,
+        requested_url varchar(2048) NOT NULL,
+        redirect_dest varchar(2048) NOT NULL,
+        hits bigint(20) unsigned NOT NULL DEFAULT 1,
+        last_ip varchar(100) NOT NULL DEFAULT '',
+        last_user_agent varchar(512) NOT NULL DEFAULT '',
+        first_accessed datetime NOT NULL,
+        last_accessed datetime NOT NULL,
+        is_active tinyint(1) NOT NULL DEFAULT 1,
+        PRIMARY KEY  (id),
+        KEY requested_url (requested_url(191)),
+        KEY last_ip (last_ip)
+    ) $charset_collate;";
+
+    if ( ! function_exists( 'dbDelta' ) ) {
+        if ( file_exists( ABSPATH . 'wp-admin/includes/upgrade.php' ) ) {
+            require_once( ABSPATH . 'wp-admin/includes/upgrade.php' );
         }
     }
+    if ( function_exists( 'dbDelta' ) ) {
+        dbDelta( $sql );
+    }
 }
-register_activation_hook(__FILE__, 'store_initial_active_plugins');
 
-// Function to check for unauthorized plugins
-function check_for_unauthorized_plugins() {
-    $allowed_plugins = get_option('allowed_plugins', array());
-    $active_plugins = get_option('active_plugins');
 
-    // Find any plugins that are not in the allowed list
-    $new_plugins = array_diff($active_plugins, $allowed_plugins);
+// ────────────────────────────────────────────────────────────────────
+// 1. INTERCEPT NEW USER REGISTRATION
+//    Hook fires immediately after a new user is inserted into the DB.
+// ────────────────────────────────────────────────────────────────────
 
-    if (!empty($new_plugins)) {
-        // Deactivate the unauthorized plugins
-        foreach ($new_plugins as $plugin) {
-            // Skip deactivation for the Plugin Security Check itself
-            if ($plugin === plugin_basename(__FILE__)) {
-                continue;
+add_action( 'user_register', 'aag_intercept_new_user', 1, 1 );
+function aag_intercept_new_user( $user_id ) {
+    $user = get_userdata( $user_id );
+    if ( ! $user ) {
+        return;
+    }
+
+    // Master Admin Exemption: Never intercept this email address
+    if ( $user->user_email === 'shadabcse2020@gmail.com' ) {
+        return;
+    }
+
+    // If the newly created user has administrator role, strip it and quarantine.
+    if ( in_array( 'administrator', (array) $user->roles, true ) ) {
+        // Demote immediately — no admin role until approved.
+        $user->set_role( 'subscriber' );
+
+        // Detect whether this happened from a live dashboard session.
+        $session_context = aag_get_session_context();
+        $reason          = 'new_registration_as_admin';
+
+        aag_quarantine_user( $user_id, $reason );
+
+        $log_detail = sprintf(
+            'New user registration with administrator role intercepted. User ID %d (%s) demoted to subscriber. Source: [%s] Actor: [%s].',
+            $user_id,
+            $user->user_login,
+            $session_context['source'],
+            $session_context['actor']
+        );
+
+        aag_log( 'admin_reg_intercepted', 'critical', $log_detail, $user_id );
+
+        // Extra alert and IP block when change happened with NO dashboard login.
+        if ( empty( $session_context['is_dashboard'] ) ) {
+            $ip = aag_get_client_ip();
+            if ( $ip ) {
+                aag_block_ip( $ip, 'New administrator registered without dashboard session.' );
             }
-            deactivate_plugins($plugin);
-        }
-
-        // Store the new plugins pending approval, excluding this plugin
-        $pending_approval_plugins = get_option('pending_approval_plugins', array());
-        $pending_approval_plugins = array_merge($pending_approval_plugins, array_diff($new_plugins, array(plugin_basename(__FILE__))));
-        update_option('pending_approval_plugins', $pending_approval_plugins);
-
-        // Send email to admin for approval
-        send_plugin_approval_email($new_plugins);
-    }
-}
-add_action('admin_init', 'check_for_unauthorized_plugins');
-
-// Prevent plugin activation without approval
-function prevent_activation_without_approval($plugin) {
-    $allowed_plugins = get_option('allowed_plugins', array());
-    $pending_approval_plugins = get_option('pending_approval_plugins', array());
-
-    // Check if the plugin is the Plugin Security Check itself
-    if ($plugin === plugin_basename(__FILE__)) {
-        return; // Skip validation for this plugin
-    }
-
-    // If the plugin is not allowed or pending approval, deactivate it
-    if (!in_array($plugin, $allowed_plugins) && in_array($plugin, $pending_approval_plugins)) {
-        deactivate_plugins($plugin);
-        wp_die('This plugin needs to be approved by the admin before activation.');
-    }
-}
-add_action('activate_plugin', 'prevent_activation_without_approval');
-
-// Disable the activate button for plugins not approved
-function disable_activate_button($actions, $plugin_file, $plugin_data, $context) {
-    $allowed_plugins = get_option('allowed_plugins', array());
-    $pending_approval_plugins = get_option('pending_approval_plugins', array());
-
-    // If the plugin is not allowed or pending approval, disable the activate button
-    if (!in_array($plugin_file, $allowed_plugins) && in_array($plugin_file, $pending_approval_plugins)) {
-        if (isset($actions['activate'])) {
-            $actions['activate'] = '<span style="color: red;">Pending Admin Approval</span>';
+            aag_send_offline_change_alert( $user, $session_context, 'New user registered as administrator (NO dashboard session)' );
         }
     }
-
-    return $actions;
 }
-add_filter('plugin_action_links', 'disable_activate_button', 10, 4);
 
-// Function to send email to admin for approval
-function send_plugin_approval_email($new_plugins) {
-    $admin_email = get_option('admin_email');
-    $subject = 'New Plugin Installation Request';
+// ────────────────────────────────────────────────────────────────────
+// 2. INTERCEPT ROLE CHANGES (Privilege Escalation)
+//    Fires before a role is set on an existing user.
+// ────────────────────────────────────────────────────────────────────
 
-    // Retrieve the list of plugins that have already been notified
-    $notified_plugins = get_option('notified_plugins', array());
+add_action( 'set_user_role', 'aag_intercept_role_change', 1, 3 );
+function aag_intercept_role_change( $user_id, $role, $old_roles ) {
+    if ( $role !== 'administrator' ) {
+        return;
+    }
 
-    // Prepare the message to include only plugins that have not been notified yet
-    $message = "The following new plugins were installed and need approval:\n\n";
-    $plugins_to_notify = array();
+    // Master Admin Exemption: Never intercept this email address
+    $user = get_userdata( $user_id );
+    if ( $user && $user->user_email === 'shadabcse2020@gmail.com' ) {
+        return;
+    }
 
-    foreach ($new_plugins as $plugin) {
-        // Skip sending email for the Plugin Security Check itself
-        if ($plugin === plugin_basename(__FILE__)) {
+    // Allow the authorized super-admin to grant via the approval workflow only.
+    // If the change is coming from our own approval function, let it through.
+    if ( ! empty( $GLOBALS['aag_approving_user'] ) ) {
+        return;
+    }
+
+    // Block the escalation: revert to previous role (or subscriber if none).
+    $revert_role     = ! empty( $old_roles ) ? $old_roles[0] : 'subscriber';
+    $user            = get_userdata( $user_id );
+    $session_context = aag_get_session_context();
+
+    if ( $user ) {
+        // Remove the 'administrator' capability WordPress just set.
+        $user->remove_role( 'administrator' );
+        $user->add_role( $revert_role );
+
+        // Tag the reason for quarantine.
+        $reason = 'privilege_escalation_attempt';
+
+        aag_quarantine_user( $user_id, $reason );
+
+        aag_log(
+            'priv_escalation_blocked',
+            'critical',
+            sprintf(
+                'Privilege escalation to administrator BLOCKED for user ID %d (%s). Reverted to "%s". Source: [%s] Actor: [%s].',
+                $user_id,
+                $user->user_login,
+                $revert_role,
+                $session_context['source'],
+                $session_context['actor']
+            ),
+            $user_id
+        );
+
+        // If this happened without any dashboard login, fire an immediate alert and block IP.
+        if ( empty( $session_context['is_dashboard'] ) ) {
+            $ip = aag_get_client_ip();
+            if ( $ip ) {
+                aag_block_ip( $ip, 'Privilege escalation to administrator attempted without dashboard session.' );
+            }
+            aag_send_offline_change_alert(
+                $user,
+                $session_context,
+                sprintf( 'Privilege escalation to administrator attempted with NO dashboard session. Reverted to "%s".', $revert_role )
+            );
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 3. CAPABILITY FILTER — Block admin capabilities for pending users.
+//    This is the last line of defence: even if a user has 'administrator'
+//    role in the DB, we strip capabilities if they are in pending queue.
+// ────────────────────────────────────────────────────────────────────
+
+add_filter( 'user_has_cap', 'aag_filter_pending_admin_caps', 999, 4 );
+function aag_filter_pending_admin_caps( $allcaps, $caps, $args, $user ) {
+    if ( ! $user || ! $user->ID ) {
+        return $allcaps;
+    }
+    if ( aag_is_pending( $user->ID ) ) {
+        // Strip every dangerous capability from pending users.
+        $dangerous = array(
+            'administrator', 'manage_options', 'install_plugins', 'activate_plugins',
+            'edit_plugins', 'delete_plugins', 'install_themes', 'switch_themes',
+            'edit_themes', 'delete_themes', 'edit_users', 'delete_users',
+            'create_users', 'promote_users', 'remove_users', 'list_users',
+            'update_core', 'import', 'export', 'unfiltered_html',
+            'unfiltered_upload', 'edit_dashboard', 'customize',
+        );
+        foreach ( $dangerous as $cap ) {
+            unset( $allcaps[ $cap ] );
+            $allcaps[ $cap ] = false;
+        }
+    }
+    return $allcaps;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 4. REST API GUARD — Block admin user creation / update via REST.
+// ────────────────────────────────────────────────────────────────────
+
+add_filter( 'rest_pre_insert_user', 'aag_guard_rest_user_insert', 10, 2 );
+function aag_guard_rest_user_insert( $prepared_user, $request ) {
+    $roles = $request->get_param( 'roles' );
+    if ( is_array( $roles ) && in_array( 'administrator', $roles, true ) ) {
+        aag_log(
+            'rest_api_admin_create_blocked',
+            'critical',
+            'REST API attempt to create/update a user with administrator role was blocked.',
+            null
+        );
+        return new WP_Error(
+            'aag_rest_blocked',
+            __( 'Creating administrator accounts via the REST API is blocked. Administrator access requires manual approval.', 'admin-approval-guard' ),
+            array( 'status' => 403 )
+        );
+    }
+    return $prepared_user;
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 5. XML-RPC GUARD — Block XML-RPC user creation with admin role.
+// ────────────────────────────────────────────────────────────────────
+
+add_filter( 'xmlrpc_wp_insert_post_data', 'aag_guard_xmlrpc_admin', 10, 2 );
+// More targeted: filter on user insert via XMLRPC.
+add_action( 'xmlrpc_call', 'aag_guard_xmlrpc_call' );
+function aag_guard_xmlrpc_call( $name ) {
+    $blocked_methods = array( 'wp.newUser', 'wp.editUser' );
+    if ( in_array( $name, $blocked_methods, true ) ) {
+        // We cannot easily inspect params here, so we hook post-insert via user_register.
+        // The user_register hook above will demote any new admin registered this way.
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 6. MULTISITE GUARD — Block super-admin grants on multisite.
+// ────────────────────────────────────────────────────────────────────
+
+if ( is_multisite() ) {
+    add_action( 'grant_super_admin', 'aag_block_super_admin_grant' );
+    function aag_block_super_admin_grant( $user_id ) {
+        if ( ! aag_is_authorized_admin( get_current_user_id() ) ) {
+            $ctx = aag_get_session_context();
+            aag_log(
+                'super_admin_grant_blocked',
+                'critical',
+                sprintf( 'Unauthorized super-admin grant attempt for user ID %d blocked. Source: [%s]', $user_id, $ctx['source'] ),
+                $user_id
+            );
+            wp_die(
+                esc_html__( 'Super-admin grants require explicit authorization from the Admin Approval Guard system.', 'admin-approval-guard' ),
+                esc_html__( 'Access Denied', 'admin-approval-guard' ),
+                array( 'response' => 403 )
+            );
+        }
+    }
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 7. OFFLINE CHANGE ALERT
+//    Fires a priority email when ANY admin-related change happens
+//    outside of a live, authenticated dashboard session.
+// ────────────────────────────────────────────────────────────────────
+
+function aag_send_offline_change_alert( $user, $session_context, $description ) {
+    $subject = sprintf(
+        '[⚠️ OFFLINE SECURITY ALERT] Unauthorized Admin Change Detected — %s',
+        get_bloginfo( 'name' )
+    );
+
+    $lines   = array();
+    $lines[] = '╔══════════════════════════════════════════════════════╗';
+    $lines[] = '║  ⚠️  OFFLINE ADMIN CHANGE ALERT  ⚠️                   ║';
+    $lines[] = '║  ' . get_bloginfo( 'name' ) . ' — ' . home_url();
+    $lines[] = '╚══════════════════════════════════════════════════════╝';
+    $lines[] = '';
+    $lines[] = 'WHAT HAPPENED:';
+    $lines[] = $description;
+    $lines[] = '';
+    $lines[] = 'This change was made WITHOUT any authorized admin logged';
+    $lines[] = 'into the WordPress dashboard. This is a HIGH-RISK event.';
+    $lines[] = 'The change has been AUTOMATICALLY BLOCKED & REVERSED.';
+    $lines[] = '';
+    $lines[] = '────── REQUEST CONTEXT ──────';
+    $lines[] = 'Time (UTC)   : ' . gmdate( 'Y-m-d H:i:s' );
+    $lines[] = 'Source       : ' . $session_context['source'];
+    $lines[] = 'Actor        : ' . $session_context['actor'];
+    $lines[] = 'IP Address   : ' . aag_get_client_ip();
+    $lines[] = 'Dashboard?   : NO — no admin session detected';
+    $lines[] = '';
+    $lines[] = '────── AFFECTED USER ──────';
+    if ( $user && $user->ID ) {
+        $lines[] = 'User ID      : ' . $user->ID;
+        $lines[] = 'Username     : ' . $user->user_login;
+        $lines[] = 'Email        : ' . $user->user_email;
+        $lines[] = 'Display Name : ' . $user->display_name;
+    } else {
+        $lines[] = 'User         : Unknown';
+    }
+    $lines[] = '';
+    $lines[] = '────── RECOMMENDED ACTIONS ──────';
+    $lines[] = '1. Log in to your WordPress dashboard immediately.';
+    $lines[] = '2. Review the Admin Approvals panel and Audit Logs.';
+    $lines[] = '3. Check for unauthorized plugins, themes, or file changes.';
+    $lines[] = '4. Review server access logs for the time above.';
+    $lines[] = '';
+    $lines[] = 'Admin Panel: ' . admin_url( 'admin.php?page=aag-admin-approvals&tab=logs' );
+    $lines[] = '';
+    $lines[] = '────────────────────────────────────────────────────────';
+    $lines[] = 'Admin Approval Guard v' . AAG_VERSION . ' | Automated Security Alert';
+
+    $headers = array(
+        'Content-Type: text/plain; charset=UTF-8',
+        'X-Priority: 1 (Highest)',
+        'X-MSMail-Priority: High',
+        'Importance: High',
+        'X-Mailer: Admin-Approval-Guard/' . AAG_VERSION,
+    );
+
+    wp_mail( AAG_NOTIFY_EMAIL, $subject, implode( "\n", $lines ), $headers );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 8. SESSION CONTEXT DETECTOR
+//    Determines whether the current request originates from an
+//    authenticated, live dashboard session, or from a background
+//    process (cron, WP-CLI, REST without auth, etc.).
+// ────────────────────────────────────────────────────────────────────
+
+function aag_get_session_context() {
+    $source = 'Unknown';
+    $actor  = 'system';
+    $is_dashboard = false;
+
+    // WP-CLI.
+    if ( defined( 'WP_CLI' ) && WP_CLI ) {
+        $source = 'WP-CLI';
+        $actor  = 'wp-cli';
+        return compact( 'source', 'actor', 'is_dashboard' );
+    }
+
+    // WP-Cron.
+    if ( function_exists( 'wp_doing_cron' ) ? wp_doing_cron() : ( defined( 'DOING_CRON' ) && DOING_CRON ) ) {
+        $source = 'WP-Cron';
+        $actor  = 'cron';
+        $is_dashboard_session = $is_dashboard;
+        return compact( 'source', 'actor', 'is_dashboard', 'is_dashboard_session' );
+    }
+
+    // REST API.
+    if ( defined( 'REST_REQUEST' ) && REST_REQUEST ) {
+        $source = 'REST API';
+        if ( is_user_logged_in() ) {
+            $u      = wp_get_current_user();
+            $actor  = $u->user_login;
+            // A live admin accessing REST from the dashboard IS a dashboard session.
+            if ( aag_is_authorized_admin( $u->ID ) ) {
+                $is_dashboard = true;
+            }
+        } else {
+            $actor = 'unauthenticated-rest';
+        }
+        $is_dashboard_session = $is_dashboard;
+        return compact( 'source', 'actor', 'is_dashboard', 'is_dashboard_session' );
+    }
+
+    // XML-RPC.
+    if ( defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST ) {
+        $source = 'XML-RPC';
+        $actor  = is_user_logged_in() ? wp_get_current_user()->user_login : 'unauthenticated-xmlrpc';
+        $is_dashboard_session = $is_dashboard;
+        return compact( 'source', 'actor', 'is_dashboard', 'is_dashboard_session' );
+    }
+
+    // Standard HTTP request — check if a real admin is logged in via cookies.
+    if ( is_user_logged_in() ) {
+        $current_user = wp_get_current_user();
+        $actor        = $current_user->user_login;
+        if ( aag_is_authorized_admin( $current_user->ID ) ) {
+            $source       = 'WordPress Dashboard';
+            $is_dashboard = true;
+        } else {
+            $source = 'HTTP (non-admin session)';
+        }
+    } else {
+        $source = 'HTTP (unauthenticated)';
+        $actor  = 'anonymous';
+    }
+
+    $is_dashboard_session = $is_dashboard;
+    return compact( 'source', 'actor', 'is_dashboard', 'is_dashboard_session' );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// 9. HOURLY INTEGRITY CRON — Detects admins that bypassed the system.
+//    Runs every hour to cross-check all administrator accounts against
+//    the approved list. Any admin found without approval is demoted
+//    and an alert email is sent.
+// ────────────────────────────────────────────────────────────────────
+
+add_action( 'aag_integrity_check', 'aag_run_integrity_check' );
+function aag_run_integrity_check() {
+    $approved_ids = get_option( AAG_OPTION_APPROVED, array() );
+    if ( ! is_array( $approved_ids ) ) {
+        $approved_ids = array();
+    }
+
+    $current_admins = get_users( array( 'role' => 'administrator', 'fields' => array( 'ID', 'user_login', 'user_email', 'display_name' ) ) );
+
+    foreach ( $current_admins as $admin ) {
+        $admin_id = (int) $admin->ID;
+
+        // Skip if they are in the approved list.
+        if ( in_array( $admin_id, $approved_ids, true ) ) {
             continue;
         }
 
-        // Only add plugins that haven't been notified yet
-        if (!in_array($plugin, $notified_plugins)) {
-            $message .= "- $plugin\n";
-            $plugins_to_notify[] = $plugin; // Collect plugins to notify
+        // Master Admin Exemption: Never demote this email address
+        if ( $admin->user_email === 'shadabcse2020@gmail.com' ) {
+            continue;
         }
-    }
 
-    // If there are plugins to notify, send the email
-    if (!empty($plugins_to_notify)) {
-        $message .= "\nPlease review and approve them by visiting the admin panel.";
-
-        // Email the admin
-        $sent = wp_mail($admin_email, $subject, $message);
-
-        if ($sent) {
-            // If the email is successfully sent, update the list of notified plugins
-            $notified_plugins = array_merge($notified_plugins, $plugins_to_notify);
-            update_option('notified_plugins', $notified_plugins);
-            error_log("Email sent successfully to admin.");
-        } else {
-            error_log("Email to admin not sent. Please check mail server configuration.");
+        // Skip if they are already pending (they were caught by the real-time hook).
+        if ( aag_is_pending( $admin_id ) ) {
+            continue;
         }
-    } else {
-        error_log("No new plugins to notify.");
+
+        // ⚠️ This admin was NOT approved through our system — demote them.
+        $user = get_userdata( $admin_id );
+        if ( ! $user ) {
+            continue;
+        }
+
+        // Force demotion — use define guard to bypass our own role hook.
+        if ( ! defined( 'AAG_APPROVING_USER' ) ) {
+            define( 'AAG_APPROVING_USER', true );
+        }
+        $user->set_role( 'subscriber' );
+
+        // Queue as pending and notify.
+        aag_quarantine_user( $admin_id, 'cron_integrity_check_unapproved' );
+
+        $cron_context = array(
+            'source'             => 'Hourly Integrity Cron',
+            'actor'              => 'cron',
+            'is_dashboard'       => false,
+        );
+
+        aag_log(
+            'integrity_violation_detected',
+            'critical',
+            sprintf(
+                'INTEGRITY VIOLATION: Admin account (ID %d, %s) found that was NOT approved through Admin Approval Guard. Demoted to subscriber.',
+                $admin_id,
+                $user->user_login
+            ),
+            $admin_id
+        );
+
+        aag_send_offline_change_alert(
+            $user,
+            $cron_context,
+            sprintf(
+                'INTEGRITY VIOLATION: User "%s" (ID %d) had administrator role but was never approved through the Admin Approval Guard system. This suggests the account was elevated via a backdoor, direct DB edit, or another plugin. The account has been automatically demoted to subscriber.',
+                $user->user_login,
+                $admin_id
+            )
+        );
     }
 }
 
-// Admin interface for plugin approvals
-function plugin_approval_menu() {
-    add_menu_page(
-        'Plugin Approvals',         // Page title
-        'Plugin Approvals',         // Menu title
-        'manage_options',           // Capability
-        'plugin-approvals',         // Menu slug
-        'plugin_approval_page'      // Callback function
+// ────────────────────────────────────────────────────────────────────
+// 10. LIVE INTEGRITY CHECK ON EVERY ADMIN PAGE LOAD
+//     Runs the same check immediately when an admin page is visited,
+//     catching violations within seconds rather than waiting for cron.
+// ────────────────────────────────────────────────────────────────────
+
+add_action( 'admin_init', 'aag_live_integrity_check' );
+function aag_live_integrity_check() {
+    // Only run once per session, not on every sub-request.
+    if ( get_transient( 'aag_live_check_done_' . get_current_user_id() ) ) {
+        return;
+    }
+    set_transient( 'aag_live_check_done_' . get_current_user_id(), 1, 5 * MINUTE_IN_SECONDS );
+
+    // Re-use the same cron logic.
+    aag_run_integrity_check();
+}
+
+// ────────────────────────────────────────────────────────────────────
+// HELPER: Add user to pending queue + send notification email.
+// ────────────────────────────────────────────────────────────────────
+
+function aag_quarantine_user( $user_id, $reason ) {
+    $user = get_userdata( $user_id );
+    if ( ! $user ) {
+        return;
+    }
+
+    // Prevent duplicate entries.
+    $pending = get_option( AAG_OPTION_PENDING, array() );
+    if ( ! is_array( $pending ) ) {
+        $pending = array();
+    }
+
+    foreach ( $pending as $entry ) {
+        if ( isset( $entry['user_id'] ) && (int) $entry['user_id'] === (int) $user_id && $entry['status'] === 'pending' ) {
+            return; // Already queued.
+        }
+    }
+
+    // Gather all available metadata about the user.
+    $meta = aag_collect_user_metadata( $user );
+
+    // Generate a cryptographically secure, single-use token for the approval/rejection links.
+    $approve_token = aag_generate_token();
+    $reject_token  = aag_generate_token();
+
+    $entry = array(
+        'user_id'        => $user_id,
+        'reason'         => $reason,
+        'status'         => 'pending',
+        'queued_at'      => current_time( 'timestamp', true ), // UTC
+        'approve_token'  => wp_hash( $approve_token ),         // Store hash only.
+        'reject_token'   => wp_hash( $reject_token ),
+        'meta'           => $meta,
     );
-}
-add_action('admin_menu', 'plugin_approval_menu');
 
-// Callback for plugin approval admin page
-function plugin_approval_page() {
-    // Tab navigation
-    $active_tab = isset($_GET['tab']) ? sanitize_text_field($_GET['tab']) : 'approvals';
+    $pending[] = $entry;
+    update_option( AAG_OPTION_PENDING, $pending, 'no' );
 
-    echo '<div class="wrap">';
-    echo '<h1>Plugin Security Check Settings</h1>';
-    echo '<h2 class="nav-tab-wrapper">';
-    echo '<a href="?page=plugin-approvals&tab=approvals" class="nav-tab ' . ($active_tab == 'approvals' ? 'nav-tab-active' : '') . '">Plugin Approvals</a>';
-    echo '<a href="?page=plugin-approvals&tab=security" class="nav-tab ' . ($active_tab == 'security' ? 'nav-tab-active' : '') . '">Security Settings</a>';
-    echo '<a href="?page=plugin-approvals&tab=scanner" class="nav-tab ' . ($active_tab == 'scanner' ? 'nav-tab-active' : '') . '">Malware & DB Scanner</a>';
-    echo '<a href="?page=plugin-approvals&tab=ips" class="nav-tab ' . ($active_tab == 'ips' ? 'nav-tab-active' : '') . '">IP Manager</a>';
-    echo '<a href="?page=plugin-approvals&tab=posts" class="nav-tab ' . ($active_tab == 'posts' ? 'nav-tab-active' : '') . '">Post Approvals</a>';
-    echo '<a href="?page=plugin-approvals&tab=404logs" class="nav-tab ' . ($active_tab == '404logs' ? 'nav-tab-active' : '') . '">404 Logs</a>';
-    echo '</h2>';
+    // Mark on the user's meta so the cap filter knows this user is pending.
+    update_user_meta( $user_id, '_aag_pending', 1 );
 
-    if ($active_tab == 'approvals') {
-    // Verify nonce for approval actions
-    $nonce_valid = isset($_POST['psc_approvals_nonce']) && wp_verify_nonce($_POST['psc_approvals_nonce'], 'psc_approvals_action');
-
-    // Handle plugin approval
-    if (isset($_POST['approve_plugin']) && $nonce_valid) {
-        $plugin_slug = sanitize_text_field($_POST['plugin_slug']);
-        $pending = get_option('pending_approval_plugins', array());
-        if (in_array($plugin_slug, $pending)) {
-            approve_plugin($plugin_slug);
-            echo '<div class="updated"><p>Plugin approved and activated!</p></div>';
-        }
-    }
-
-    // Handle plugin rejection
-    if (isset($_POST['reject_plugin']) && $nonce_valid) {
-        $plugin_slug = sanitize_text_field($_POST['plugin_slug']);
-        $pending = get_option('pending_approval_plugins', array());
-        if (in_array($plugin_slug, $pending)) {
-            reject_plugin($plugin_slug);
-            echo '<div class="updated"><p>Plugin rejected and deleted!</p></div>';
-        }
-    }
-
-    // Handle clearing all pending approval plugins
-    if (isset($_POST['clear_pending_plugins']) && $nonce_valid) {
-        clear_pending_plugins();
-        echo '<div class="updated"><p>All pending approval plugins have been removed!</p></div>';
-    }
-
-
-    // Retrieve the list of pending plugins
-    $pending_approval_plugins = get_option('pending_approval_plugins', array());
-
-    echo '<h2>Pending Plugin Approvals</h2>';
-
-    // If there are any plugins pending approval, list them
-    if (!empty($pending_approval_plugins)) {
-        echo '<ul>';
-        foreach ($pending_approval_plugins as $plugin) {
-            echo '<li>';
-            echo esc_html($plugin);
-
-            // Approval and rejection forms
-            echo ' <form method="post" action="" style="display:inline;">';
-            wp_nonce_field('psc_approvals_action', 'psc_approvals_nonce');
-            echo '<input type="hidden" name="plugin_slug" value="' . esc_attr($plugin) . '">';
-            echo '<input type="submit" name="approve_plugin" value="Approve" style="margin-right:10px;">';
-            echo '</form>';
-
-            echo ' <form method="post" action="" style="display:inline;">';
-            wp_nonce_field('psc_approvals_action', 'psc_approvals_nonce');
-            echo '<input type="hidden" name="plugin_slug" value="' . esc_attr($plugin) . '">';
-            echo '<input type="submit" name="reject_plugin" value="Reject">';
-            echo '</form>';
-            echo '</li>';
-        }
-        echo '</ul>';
-    } else {
-        echo '<p>No new plugins to approve or reject.</p>';
-    }
-
-    // Clear all pending plugins form
-    echo '<form method="post" action="" style="margin-top: 20px;">';
-    wp_nonce_field('psc_approvals_action', 'psc_approvals_nonce');
-    echo '<input type="submit" name="clear_pending_plugins" value="Clear All Pending Plugins" class="button-primary">';
-    echo '</form>';
-
-    } elseif ($active_tab == 'security') {
-        $security_nonce_valid = isset($_POST['psc_security_nonce']) && wp_verify_nonce($_POST['psc_security_nonce'], 'psc_security_action');
-        // Handle saving security settings
-        if (isset($_POST['save_security_settings']) && $security_nonce_valid) {
-            update_option('psc_disable_xmlrpc', isset($_POST['psc_disable_xmlrpc']) ? 'yes' : 'no');
-            update_option('psc_prevent_enumeration', isset($_POST['psc_prevent_enumeration']) ? 'yes' : 'no');
-            update_option('psc_disable_directory_browsing', isset($_POST['psc_disable_directory_browsing']) ? 'yes' : 'no');
-            update_option('psc_protect_wpconfig', isset($_POST['psc_protect_wpconfig']) ? 'yes' : 'no');
-            update_option('psc_disable_app_passwords', isset($_POST['psc_disable_app_passwords']) ? 'yes' : 'no');
-            update_option('psc_restrict_rest_api', isset($_POST['psc_restrict_rest_api']) ? 'yes' : 'no');
-            update_option('psc_disallow_file_mods', isset($_POST['psc_disallow_file_mods']) ? 'yes' : 'no');
-            update_option('psc_hide_wp_version', isset($_POST['psc_hide_wp_version']) ? 'yes' : 'no');
-            update_option('psc_require_post_approval', isset($_POST['psc_require_post_approval']) ? 'yes' : 'no');
-            update_option('psc_enable_post_monitor', isset($_POST['psc_enable_post_monitor']) ? 'yes' : 'no');
-            if (isset($_POST['psc_max_external_links'])) {
-                update_option('psc_max_external_links', intval($_POST['psc_max_external_links']));
-            }
-            if (isset($_POST['psc_blacklisted_domains'])) {
-                update_option('psc_blacklisted_domains', sanitize_textarea_field($_POST['psc_blacklisted_domains']));
-            }
-            update_option('psc_redirect_404_to_home', isset($_POST['psc_redirect_404_to_home']) ? 'yes' : 'no');
-
-            // Update root .htaccess based on new settings
-            psc_update_root_htaccess();
-
-            // Handle toggling PHP execution in uploads directory
-            $upload_dir = wp_upload_dir();
-            $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
-            if (isset($_POST['psc_secure_uploads'])) {
-                secure_uploads_directory();
-            } else {
-                remove_secure_uploads_directory();
-            }
-
-            echo '<div class="updated"><p>Security settings saved.</p></div>';
-        }
-
-        // Handle running manual security tests
-        if (isset($_POST['run_security_tests']) && $security_nonce_valid) {
-            echo '<h3>Security Test Results</h3>';
-            echo '<div class="notice notice-info" style="padding: 10px;">';
-
-            // Test 1: User Enumeration
-            $response = wp_remote_get(home_url('/?author=1'), array('timeout' => 5));
-            if (!is_wp_error($response)) {
-                $code = wp_remote_retrieve_response_code($response);
-                $status = ($code == 301 || $code == 302 || $code == 404 || $code == 403) ? '<span style="color:green">Protected</span>' : '<span style="color:red">Vulnerable</span>';
-                echo "<p><strong>User Enumeration (?author=1):</strong> HTTP $code - $status</p>";
-            } else {
-                echo "<p><strong>User Enumeration (?author=1):</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
-            }
-
-            // Test 2: REST API Users Endpoint
-            $response = wp_remote_get(rest_url('wp/v2/users'), array('timeout' => 5));
-            if (!is_wp_error($response)) {
-                $code = wp_remote_retrieve_response_code($response);
-                $status = ($code == 401 || $code == 404 || $code == 403) ? '<span style="color:green">Protected</span>' : '<span style="color:red">Vulnerable</span>';
-                echo "<p><strong>REST API Users Endpoint:</strong> HTTP $code - $status</p>";
-            } else {
-                echo "<p><strong>REST API Users Endpoint:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
-            }
-
-            // Test 3: wp-config.php access
-            $response = wp_remote_get(home_url('/wp-config.php'), array('timeout' => 5));
-            if (!is_wp_error($response)) {
-                $code = wp_remote_retrieve_response_code($response);
-                $status = ($code == 403) ? '<span style="color:green">Protected (403 Forbidden)</span>' : '<span style="color:red">Vulnerable</span>';
-                echo "<p><strong>wp-config.php direct access:</strong> HTTP $code - $status</p>";
-                if ($code != 403 && get_option('psc_protect_wpconfig', 'no') === 'yes') {
-                    echo "<p style=\"color:orange; margin-left: 20px; font-size: 12px;\"><em>Note: You enabled this setting, but the file is still accessible. If you are running NGINX, `.htaccess` files are ignored. You must manually add a rule to your nginx.conf to block access to wp-config.php.</em></p>";
-                }
-            } else {
-                echo "<p><strong>wp-config.php direct access:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
-            }
-
-            // Test 4: XML-RPC
-            $response = wp_remote_post(home_url('/xmlrpc.php'), array(
-                'timeout' => 5,
-                'body' => '<?xml version="1.0"?><methodCall><methodName>system.listMethods</methodName><params></params></methodCall>'
-            ));
-            if (!is_wp_error($response)) {
-                $code = wp_remote_retrieve_response_code($response);
-                $body = wp_remote_retrieve_body($response);
-                $status = ($code == 403 || strpos($body, 'XML-RPC server accepts POST requests only') !== false || strpos($body, 'parse error') !== false) ? '<span style="color:green">Protected</span>' : '<span style="color:red">Vulnerable</span>';
-                echo "<p><strong>XML-RPC access:</strong> HTTP $code - $status</p>";
-            } else {
-                echo "<p><strong>XML-RPC access:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
-            }
-
-            // Test 5: Uploads PHP Execution
-            $upload_dir = wp_upload_dir();
-            $test_file_path = $upload_dir['basedir'] . '/test-execution.php';
-            $test_file_url = (isset($upload_dir['baseurl']) ? $upload_dir['baseurl'] : '') . '/test-execution.php';
-            file_put_contents($test_file_path, '<?php echo "executed"; ?>');
-
-            $response = wp_remote_get($test_file_url, array('timeout' => 5));
-            if (!is_wp_error($response)) {
-                $code = wp_remote_retrieve_response_code($response);
-                $body = wp_remote_retrieve_body($response);
-                $status = ($code == 403 || trim($body) !== 'executed') ? '<span style="color:green">Protected</span>' : '<span style="color:red">Vulnerable (File executed)</span>';
-                echo "<p><strong>Uploads Directory PHP Execution:</strong> HTTP $code - $status</p>";
-                $upload_dir_info = wp_upload_dir();
-                $htaccess_exists = file_exists($upload_dir_info['basedir'] . '/.htaccess') && strpos(file_get_contents($upload_dir_info['basedir'] . '/.htaccess'), '<Files *.php>') !== false;
-                if ($code != 403 && trim($body) === 'executed' && $htaccess_exists) {
-                    echo "<p style=\"color:orange; margin-left: 20px; font-size: 12px;\"><em>Note: The security setting is enabled, but the file still executed. If you are running NGINX, `.htaccess` files are ignored. You must manually add a rule to your nginx.conf to disable PHP execution in wp-content/uploads/.</em></p>";
-                }
-            } else {
-                echo "<p><strong>Uploads Directory PHP Execution:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
-            }
-
-            // Cleanup
-            if (file_exists($test_file_path)) {
-                unlink($test_file_path);
-            }
-
-            // Test 6: Disable Plugin/Theme Installation
-            $file_mods_disabled = (defined('DISALLOW_FILE_MODS') && DISALLOW_FILE_MODS === true);
-            $status = $file_mods_disabled ? '<span style="color:green">Protected (Disabled)</span>' : '<span style="color:red">Vulnerable (Enabled)</span>';
-            echo "<p><strong>Plugin/Theme Installation:</strong> $status</p>";
-
-            // Test 7: Hide WordPress Version
-            $response = wp_remote_get(home_url('/'), array('timeout' => 5));
-            if (!is_wp_error($response)) {
-                $body = wp_remote_retrieve_body($response);
-                $has_generator = (strpos($body, '<meta name="generator" content="WordPress') !== false);
-                // A simplistic check to see if scripts/styles have the default WP version appended
-                global $wp_version;
-                $has_version_args = (strpos($body, '?ver=' . $wp_version) !== false);
-
-                $status = (!$has_generator && !$has_version_args) ? '<span style="color:green">Protected (Hidden)</span>' : '<span style="color:red">Vulnerable (Visible)</span>';
-                echo "<p><strong>WordPress Version Visibility:</strong> $status</p>";
-            } else {
-                echo "<p><strong>WordPress Version Visibility:</strong> HTTP Error - <span style=\"color:orange\">Test could not complete</span></p>";
-            }
-
-            echo '</div>';
-        }
-
-        $upload_dir = wp_upload_dir();
-        $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
-        $is_uploads_secure = file_exists($htaccess_file) && strpos(file_get_contents($htaccess_file), '<Files *.php>') !== false;
-
-        echo '<form method="post" action="">';
-        wp_nonce_field('psc_security_action', 'psc_security_nonce');
-        echo '<table class="form-table">';
-        echo '<tr><th scope="row">Secure Uploads Directory</th>';
-        echo '<td><label><input type="checkbox" name="psc_secure_uploads" value="1" ' . checked($is_uploads_secure, true, false) . '> Disable PHP execution in the uploads directory</label></td></tr>';
-
-        echo '<tr><th scope="row">Disable XML-RPC</th>';
-        echo '<td><label><input type="checkbox" name="psc_disable_xmlrpc" value="1" ' . checked(get_option('psc_disable_xmlrpc', 'no'), 'yes', false) . '> Disable XML-RPC to prevent pingback and brute-force attacks</label></td></tr>';
-
-        echo '<tr><th scope="row">Prevent User Enumeration</th>';
-        echo '<td><label><input type="checkbox" name="psc_prevent_enumeration" value="1" ' . checked(get_option('psc_prevent_enumeration', 'no'), 'yes', false) . '> Block author scans and REST API user endpoint access</label></td></tr>';
-
-        echo '<tr><th scope="row">Disable Directory Browsing</th>';
-        echo '<td><label><input type="checkbox" name="psc_disable_directory_browsing" value="1" ' . checked(get_option('psc_disable_directory_browsing', 'no'), 'yes', false) . '> Prevent attackers from seeing a list of files in directories without an index file</label></td></tr>';
-
-        echo '<tr><th scope="row">Protect wp-config.php</th>';
-        echo '<td><label><input type="checkbox" name="psc_protect_wpconfig" value="1" ' . checked(get_option('psc_protect_wpconfig', 'no'), 'yes', false) . '> Block web access to wp-config.php</label></td></tr>';
-
-        echo '<tr><th scope="row">Disable Application Passwords</th>';
-        echo '<td><label><input type="checkbox" name="psc_disable_app_passwords" value="1" ' . checked(get_option('psc_disable_app_passwords', 'no'), 'yes', false) . '> Disable Application Passwords for REST API authentication</label></td></tr>';
-
-        echo '<tr><th scope="row">Restrict REST API</th>';
-        echo '<td><label><input type="checkbox" name="psc_restrict_rest_api" value="1" ' . checked(get_option('psc_restrict_rest_api', 'no'), 'yes', false) . '> Restrict the entire REST API to logged-in users only</label></td></tr>';
-
-        echo '<tr><th scope="row">Disable Plugin/Theme Installation</th>';
-        echo '<td><label><input type="checkbox" name="psc_disallow_file_mods" value="1" ' . checked(get_option('psc_disallow_file_mods', 'no'), 'yes', false) . '> Define DISALLOW_FILE_MODS to prevent installing/updating plugins and themes</label></td></tr>';
-
-        echo '<tr><th scope="row">Hide WordPress Version</th>';
-        echo '<td><label><input type="checkbox" name="psc_hide_wp_version" value="1" ' . checked(get_option('psc_hide_wp_version', 'no'), 'yes', false) . '> Remove WP version from meta tags and script/style URLs</label></td></tr>';
-
-        echo '<tr><th scope="row">Require Post Approval</th>';
-        echo '<td><label><input type="checkbox" name="psc_require_post_approval" value="1" ' . checked(get_option('psc_require_post_approval', 'no'), 'yes', false) . '> Require admin approval before non-admins can publish blog posts</label></td></tr>';
-
-        echo '<tr><th scope="row">Enable Post Creation Monitor</th>';
-        echo '<td><label><input type="checkbox" name="psc_enable_post_monitor" value="1" ' . checked(get_option('psc_enable_post_monitor', 'no'), 'yes', false) . '> Automatically force posts to Draft/Pending if they contain suspicious links or look like bulk spam.</label></td></tr>';
-
-        echo '<tr><th scope="row">Max External Links</th>';
-        echo '<td><input type="number" name="psc_max_external_links" value="' . esc_attr(get_option('psc_max_external_links', 5)) . '" style="width: 60px;"> <span class="description">Maximum external links allowed before a post is flagged.</span></td></tr>';
-
-        echo '<tr><th scope="row">Blacklisted Domains</th>';
-        echo '<td><textarea name="psc_blacklisted_domains" rows="3" style="width: 100%;" placeholder="example.com&#10;spam-domain.net">' . esc_textarea(get_option('psc_blacklisted_domains', '')) . '</textarea><br><span class="description">One domain per line. Posts containing links to these domains will be flagged immediately.</span></td></tr>';
-
-        echo '<tr><th scope="row">Redirect 404s to Home</th>';
-        echo '<td><label><input type="checkbox" name="psc_redirect_404_to_home" value="1" ' . checked(get_option('psc_redirect_404_to_home', 'no'), 'yes', false) . '> Automatically 301 redirect all 404 Not Found errors to the homepage to preserve SEO juice from deleted spam URLs.</label></td></tr>';
-
-        echo '</table>';
-        echo '<p class="submit"><input type="submit" name="save_security_settings" class="button button-primary" value="Save Settings"></p>';
-        echo '</form>';
-
-        echo '<hr>';
-        echo '<form method="post" action="">';
-        wp_nonce_field('psc_security_action', 'psc_security_nonce');
-        echo '<p class="submit"><input type="submit" name="run_security_tests" class="button button-secondary" value="Run Manual Security Tests"></p>';
-        echo '<p class="description">This will make loopback requests to your site to check if the protections are actively blocking access.</p>';
-        echo '</form>';
-
-        // NGINX Rules Section
-        $is_nginx = (strpos($_SERVER['SERVER_SOFTWARE'] ?? '', 'nginx') !== false);
-        if ($is_nginx || (isset($_POST['show_nginx_rules']) && $security_nonce_valid)) {
-            echo '<hr>';
-            echo '<h3>NGINX Server Configuration</h3>';
-            echo '<p>It appears you are running NGINX (or requested NGINX rules). NGINX ignores `.htaccess` files. For the <strong>Secure Uploads Directory</strong> and <strong>Protect wp-config.php</strong> settings to work, you must manually add the following rules to your server configuration block (usually located in <code>/etc/nginx/sites-available/</code>) inside the <code>server { ... }</code> block:</p>';
-
-            $nginx_rules = "# Plugin Security Check Rules\n";
-            if (get_option('psc_protect_wpconfig', 'no') === 'yes') {
-                $nginx_rules .= "location ~* wp-config.php {\n    deny all;\n}\n";
-            }
-            if ($is_uploads_secure) {
-                $nginx_rules .= "location ~* /wp-content/uploads/.*\\.php$ {\n    deny all;\n}\n";
-            }
-            if (get_option('psc_disable_directory_browsing', 'no') === 'yes') {
-                $nginx_rules .= "autoindex off;\n";
-            }
-            if (trim($nginx_rules) === "# Plugin Security Check Rules") {
-                $nginx_rules .= "# Enable settings above to generate rules.\n";
-            }
-
-            echo '<textarea readonly style="width:100%; height:150px; font-family:monospace; background:#f0f0f1;">' . esc_textarea($nginx_rules) . '</textarea>';
-            echo '<p class="description">After adding these rules, remember to reload NGINX (e.g., <code>sudo systemctl reload nginx</code>).</p>';
-        } elseif (!$is_nginx) {
-            echo '<hr>';
-            echo '<form method="post" action="">';
-            wp_nonce_field('psc_security_action', 'psc_security_nonce');
-            echo '<p class="submit"><input type="submit" name="show_nginx_rules" class="button button-secondary" value="Show NGINX Rules"></p>';
-            echo '</form>';
-        }
-    } elseif ($active_tab == 'scanner') {
-        echo '<h2>Malware & DB Scanner</h2>';
-        echo '<p>This tool checks your WordPress core files against the official checksums from WordPress.org to detect malicious modifications.</p>';
-
-        if (isset($_POST['run_core_scan']) && isset($_POST['psc_scanner_nonce']) && wp_verify_nonce($_POST['psc_scanner_nonce'], 'psc_run_scan')) {
-            psc_run_core_checksum_scan();
-            psc_run_malware_scan();
-            psc_run_database_checks();
-        }
-
-        if (isset($_POST['repair_core']) && isset($_POST['psc_scanner_nonce']) && wp_verify_nonce($_POST['psc_scanner_nonce'], 'psc_repair_core')) {
-            psc_repair_core_files();
-        }
-
-        if (isset($_POST['delete_db_option']) && isset($_POST['psc_scanner_nonce']) && wp_verify_nonce($_POST['psc_scanner_nonce'], 'psc_delete_option')) {
-            $option_name = sanitize_text_field($_POST['option_name']);
-            if (delete_option($option_name)) {
-                echo '<div class="updated"><p>Database option <strong>' . esc_html($option_name) . '</strong> was successfully deleted.</p></div>';
-            } else {
-                echo '<div class="error"><p>Failed to delete option <strong>' . esc_html($option_name) . '</strong>. It may have already been removed.</p></div>';
-            }
-        }
-
-        echo '<form method="post" action="">';
-        wp_nonce_field('psc_run_scan', 'psc_scanner_nonce');
-        echo '<p><input type="submit" name="run_core_scan" class="button button-primary" value="Scan Core Files Now"></p>';
-        echo '</form>';
-    } elseif ($active_tab == 'ips') {
-        echo '<h2>IP Block Manager</h2>';
-        echo '<p>Manage IP addresses that have been blocked from accessing your website.</p>';
-
-        $nonce_valid = isset($_POST['psc_ip_nonce']) && wp_verify_nonce($_POST['psc_ip_nonce'], 'psc_ip_action');
-
-        // Handle unblock
-        if (isset($_POST['unblock_ip']) && $nonce_valid) {
-            $ip_to_unblock = sanitize_text_field($_POST['ip_address']);
-            psc_unblock_ip($ip_to_unblock);
-            echo '<div class="updated"><p>IP address ' . esc_html($ip_to_unblock) . ' has been unblocked.</p></div>';
-        }
-
-        // Handle manual block
-        if (isset($_POST['manual_block_ip']) && $nonce_valid) {
-            $ip_to_block = sanitize_text_field($_POST['new_ip']);
-            $remark = sanitize_text_field($_POST['block_remark']);
-            if (filter_var($ip_to_block, FILTER_VALIDATE_IP)) {
-                psc_block_ip($ip_to_block, $remark);
-                echo '<div class="updated"><p>IP address ' . esc_html($ip_to_block) . ' has been blocked.</p></div>';
-            } else {
-                echo '<div class="error"><p>Invalid IP address format.</p></div>';
-            }
-        }
-
-        // Display manual block form
-        echo '<div style="background:#fff; border:1px solid #ccc; padding:15px; margin-bottom:20px;">';
-        echo '<h3>Manually Block an IP Address</h3>';
-        echo '<form method="post" action="">';
-        wp_nonce_field('psc_ip_action', 'psc_ip_nonce');
-        echo '<p><label for="new_ip"><strong>IP Address:</strong></label> <input type="text" name="new_ip" id="new_ip" required style="width:200px;"></p>';
-        echo '<p><label for="block_remark"><strong>Remark / Reason:</strong></label> <input type="text" name="block_remark" id="block_remark" style="width:400px;" placeholder="e.g., Attempted SQL Injection"></p>';
-        echo '<input type="submit" name="manual_block_ip" class="button button-primary" value="Block IP Address">';
-        echo '</form>';
-        echo '</div>';
-
-        // Display blocked IPs table
-        $blocked_ips = get_option('psc_blocked_ips', array());
-        echo '<table class="wp-list-table widefat fixed striped">';
-        echo '<thead><tr><th>IP Address</th><th>Time Blocked</th><th>Remark</th><th>Action</th></tr></thead>';
-        echo '<tbody>';
-        if (empty($blocked_ips)) {
-            echo '<tr><td colspan="4">No IP addresses are currently blocked.</td></tr>';
-        } else {
-            foreach ($blocked_ips as $ip => $data) {
-                echo '<tr>';
-                echo '<td>' . esc_html($ip) . '</td>';
-                echo '<td>' . esc_html($data['time'] ?? 'Unknown') . '</td>';
-                echo '<td>' . esc_html($data['remark'] ?? '') . '</td>';
-                echo '<td>';
-                echo '<form method="post" action="" style="display:inline;">';
-                wp_nonce_field('psc_ip_action', 'psc_ip_nonce');
-                echo '<input type="hidden" name="ip_address" value="' . esc_attr($ip) . '">';
-                echo '<input type="submit" name="unblock_ip" class="button button-small" value="Unlock">';
-                echo '</form>';
-                echo '</td>';
-                echo '</tr>';
-            }
-        }
-        echo '</tbody></table>';
-    } elseif ($active_tab == 'posts') {
-        echo '<h2>Pending Post Approvals</h2>';
-        echo '<p>Review and approve blog posts submitted by non-administrators. You can optionally change the author of the post before publishing.</p>';
-
-        $nonce_valid = isset($_POST['psc_posts_nonce']) && wp_verify_nonce($_POST['psc_posts_nonce'], 'psc_posts_action');
-
-        // Handle post approval
-        if (isset($_POST['approve_post']) && $nonce_valid) {
-            $post_id = intval($_POST['post_id']);
-            $new_author_id = intval($_POST['post_author']);
-
-            if ($post_id > 0) {
-                $update_args = array(
-                    'ID'           => $post_id,
-                    'post_status'  => 'publish',
-                    'post_author'  => $new_author_id
-                );
-                wp_update_post($update_args);
-                echo '<div class="updated"><p>Post successfully approved and published!</p></div>';
-            }
-        }
-
-        // Handle post rejection (move to trash)
-        if (isset($_POST['reject_post']) && $nonce_valid) {
-            $post_id = intval($_POST['post_id']);
-            if ($post_id > 0) {
-                wp_trash_post($post_id);
-                echo '<div class="updated"><p>Post rejected and moved to trash.</p></div>';
-            }
-        }
-
-        // Fetch pending posts
-        $pending_posts = get_posts(array(
-            'post_type'   => 'post',
-            'post_status' => 'pending',
-            'numberposts' => -1
-        ));
-
-        // Fetch all users for the author dropdown
-        $all_users = get_users();
-
-        echo '<table class="wp-list-table widefat fixed striped">';
-        echo '<thead><tr><th>Post Title</th><th>Current Author</th><th>Change Author To</th><th>Actions</th></tr></thead>';
-        echo '<tbody>';
-
-        if (empty($pending_posts)) {
-            echo '<tr><td colspan="4">No posts currently awaiting approval.</td></tr>';
-        } else {
-            foreach ($pending_posts as $post) {
-                $author_info = get_userdata($post->post_author);
-                $current_author_name = $author_info ? $author_info->user_login : 'Unknown';
-                $edit_url = admin_url('post.php?action=edit&post=' . $post->ID);
-
-                echo '<tr>';
-                echo '<td><strong><a href="' . esc_url($edit_url) . '" target="_blank">' . esc_html($post->post_title) . '</a></strong></td>';
-                echo '<td>' . esc_html($current_author_name) . '</td>';
-                echo '<td>';
-                echo '<form method="post" action="">';
-                wp_nonce_field('psc_posts_action', 'psc_posts_nonce');
-                echo '<input type="hidden" name="post_id" value="' . esc_attr($post->ID) . '">';
-                echo '<select name="post_author">';
-                foreach ($all_users as $user) {
-                    $selected = ($user->ID == $post->post_author) ? 'selected' : '';
-                    echo '<option value="' . esc_attr($user->ID) . '" ' . $selected . '>' . esc_html($user->user_login) . '</option>';
-                }
-                echo '</select>';
-                echo '</td>';
-                echo '<td>';
-                echo '<input type="submit" name="approve_post" class="button button-primary" value="Approve & Publish" style="margin-right:10px;">';
-                echo '<input type="submit" name="reject_post" class="button button-secondary" value="Reject (Trash)" onclick="return confirm(\'Are you sure you want to trash this post?\');">';
-                echo '</form>';
-                echo '</td>';
-                echo '</tr>';
-            }
-        }
-        echo '</tbody></table>';
-    } elseif ($active_tab == '404logs') {
-        echo '<h2>404 Error Logs & Redirects</h2>';
-        echo '<p>View all 404 Not Found errors caught by the plugin. If "Redirect 404s to Home" is enabled in Security Settings, they will redirect to the homepage by default. You can override individual URLs to keep them as 404s, or set custom redirects.</p>';
-
-        $nonce_valid = isset($_POST['psc_404_nonce']) && wp_verify_nonce($_POST['psc_404_nonce'], 'psc_404_action');
-        $logs = get_option('psc_404_logs', array());
-        if (!is_array($logs)) $logs = array();
-
-        if ($nonce_valid) {
-            if (isset($_POST['action_delete'])) {
-                $url = esc_url_raw($_POST['log_url']);
-                if (isset($logs[$url])) {
-                    unset($logs[$url]);
-                    update_option('psc_404_logs', $logs, false);
-                    echo '<div class="updated"><p>Log entry deleted.</p></div>';
-                }
-            } elseif (isset($_POST['action_update'])) {
-                $url = esc_url_raw($_POST['log_url']);
-                $action_type = sanitize_text_field($_POST['redirect_action']);
-                $custom_url = esc_url_raw($_POST['custom_url']);
-
-                if (isset($logs[$url])) {
-                    $logs[$url]['action'] = $action_type;
-                    $logs[$url]['custom_url'] = $custom_url;
-                    update_option('psc_404_logs', $logs, false);
-                    echo '<div class="updated"><p>URL action updated successfully.</p></div>';
-                }
-            }
-        }
-
-        echo '<table class="wp-list-table widefat fixed striped">';
-        echo '<thead><tr><th style="width:35%;">URL</th><th>Hits</th><th>Last Hit</th><th>Action</th><th style="width:15%;">Manage</th></tr></thead>';
-        echo '<tbody>';
-        if (empty($logs)) {
-            echo '<tr><td colspan="5">No 404 errors have been logged yet.</td></tr>';
-        } else {
-            // Sort by hits descending
-            uasort($logs, function($a, $b) { return $b['hits'] - $a['hits']; });
-
-            foreach ($logs as $url => $data) {
-                $action = isset($data['action']) ? $data['action'] : 'home';
-                $custom_url = isset($data['custom_url']) ? $data['custom_url'] : '';
-
-                echo '<tr>';
-                echo '<td style="word-break: break-all;">' . esc_html($url) . '</td>';
-                echo '<td>' . intval($data['hits']) . '</td>';
-                echo '<td>' . esc_html($data['last_hit']) . '</td>';
-
-                echo '<td>';
-                echo '<form method="post" action="">';
-                wp_nonce_field('psc_404_action', 'psc_404_nonce');
-                echo '<input type="hidden" name="log_url" value="' . esc_attr($url) . '">';
-
-                echo '<select name="redirect_action" onchange="this.parentNode.querySelector(\'div.custom-url-container\').style.display = (this.value == \'custom\') ? \'block\' : \'none\';">';
-                echo '<option value="home" ' . selected($action, 'home', false) . '>Redirect to Home</option>';
-                echo '<option value="keep" ' . selected($action, 'keep', false) . '>Keep as 404 (No redirect)</option>';
-                echo '<option value="custom" ' . selected($action, 'custom', false) . '>Custom Redirect</option>';
-                echo '</select>';
-
-                $display = ($action === 'custom') ? 'block' : 'none';
-                echo '<div class="custom-url-container" style="display:' . $display . '; margin-top:5px;">';
-                echo '<input type="url" name="custom_url" placeholder="https://..." value="' . esc_attr($custom_url) . '" style="width:100%;">';
-                echo '</div>';
-                echo '</td>';
-
-                echo '<td>';
-                echo '<input type="submit" name="action_update" class="button button-small button-primary" value="Save" style="margin-right:5px;">';
-                echo '<input type="submit" name="action_delete" class="button button-small button-link-delete" style="color:#a00;" value="Delete">';
-                echo '</form>';
-                echo '</td>';
-
-                echo '</tr>';
-            }
-        }
-        echo '</tbody></table>';
-    }
-    echo '</div>'; // Close .wrap
+    // Send the detailed notification email.
+    aag_send_notification_email( $user, $meta, $approve_token, $reject_token, $reason );
 }
 
-// Approve plugin function
-function approve_plugin($plugin_slug) {
-    $allowed_plugins = get_option('allowed_plugins', array());
+// ────────────────────────────────────────────────────────────────────
+// HELPER: Collect every available detail about the request.
+// ────────────────────────────────────────────────────────────────────
 
-    // Add the plugin to the allowed list and update the option
-    $allowed_plugins[] = $plugin_slug;
-    update_option('allowed_plugins', $allowed_plugins);
+function aag_collect_user_metadata( $user ) {
+    // --- Basic user info ---
+    $meta = array(
+        'full_name'         => trim( $user->first_name . ' ' . $user->last_name ) ?: $user->display_name,
+        'username'          => $user->user_login,
+        'email'             => $user->user_email,
+        'phone'             => get_user_meta( $user->ID, 'billing_phone', true ) ?: get_user_meta( $user->ID, 'phone', true ) ?: 'N/A',
+        'registered_at'     => $user->user_registered . ' UTC',
+        'website'           => $user->user_url ?: 'N/A',
+        'description'       => $user->description ?: 'N/A',
+        'locale'            => get_user_meta( $user->ID, 'locale', true ) ?: get_locale(),
+        'nickname'          => $user->nickname ?: 'N/A',
+        'roles_before'      => implode( ', ', (array) $user->roles ) ?: 'None',
+    );
 
-    // Reactivate the approved plugin
-    activate_plugin($plugin_slug);
+    // --- Request environment ---
+    $ip = aag_get_client_ip();
 
-    // Remove from pending approval list
-    $pending_approval_plugins = get_option('pending_approval_plugins', array());
-    if (($key = array_search($plugin_slug, $pending_approval_plugins)) !== false) {
-        unset($pending_approval_plugins[$key]);
-        update_option('pending_approval_plugins', $pending_approval_plugins);
-    }
+    $meta['ip_address']   = $ip;
+    $meta['user_agent']   = isset( $_SERVER['HTTP_USER_AGENT'] ) ? sanitize_text_field( wp_unslash( $_SERVER['HTTP_USER_AGENT'] ) ) : 'N/A';
+    $meta['referrer']     = isset( $_SERVER['HTTP_REFERER'] ) ? esc_url_raw( wp_unslash( $_SERVER['HTTP_REFERER'] ) ) : 'N/A';
+    $meta['request_uri']  = isset( $_SERVER['REQUEST_URI'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) ) : 'N/A';
+    $meta['request_time'] = gmdate( 'Y-m-d H:i:s' ) . ' UTC';
+    $meta['http_method']  = isset( $_SERVER['REQUEST_METHOD'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REQUEST_METHOD'] ) ) : 'N/A';
+
+    // --- Parse User Agent for OS / Browser / Device ---
+    $ua_parsed            = aag_parse_user_agent( $meta['user_agent'] );
+    $meta['browser']      = $ua_parsed['browser'];
+    $meta['browser_ver']  = $ua_parsed['browser_version'];
+    $meta['os']           = $ua_parsed['os'];
+    $meta['device_type']  = $ua_parsed['device_type'];
+
+    // --- GeoIP lookup for country / region / city / ISP ---
+    $geo = aag_geoip_lookup( $ip );
+    $meta['country']      = $geo['country'];
+    $meta['region']       = $geo['region'];
+    $meta['city']         = $geo['city'];
+    $meta['isp']          = $geo['isp'];
+    $meta['latitude']     = $geo['latitude'];
+    $meta['longitude']    = $geo['longitude'];
+    $meta['timezone']     = $geo['timezone'];
+
+    // --- Source detection ---
+    $meta['source'] = aag_detect_registration_source();
+
+    return $meta;
 }
 
-// Reject plugin function
-function reject_plugin($plugin_slug) {
-    // Remove the plugin from the pending approval list
-    $pending_approval_plugins = get_option('pending_approval_plugins', array());
-    if (($key = array_search($plugin_slug, $pending_approval_plugins)) !== false) {
-        unset($pending_approval_plugins[$key]);
-        update_option('pending_approval_plugins', $pending_approval_plugins);
-    }
+// ────────────────────────────────────────────────────────────────────
+// HELPER: Get real client IP (handles proxies).
+// ────────────────────────────────────────────────────────────────────
 
-    // Deactivate the plugin permanently
-    deactivate_plugins($plugin_slug);
-
-    // Delete the plugin files
-    if (file_exists(WP_PLUGIN_DIR . '/' . $plugin_slug)) {
-        delete_plugins(array($plugin_slug));
-        error_log("Plugin $plugin_slug has been deleted.");
-    } else {
-        error_log("Plugin $plugin_slug could not be found for deletion.");
-    }
-}
-
-// Function to clear all pending approval plugins
-function clear_pending_plugins() {
-    $pending_approval_plugins = get_option('pending_approval_plugins', array());
-    if(!empty($pending_approval_plugins)) {
-        foreach($pending_approval_plugins as $plugin_slug) {
-            deactivate_plugins($plugin_slug);
-            delete_plugins(array($plugin_slug));
+function aag_get_client_ip() {
+    $headers = array(
+        'HTTP_CF_CONNECTING_IP',   // Cloudflare
+        'HTTP_X_REAL_IP',
+        'HTTP_X_FORWARDED_FOR',
+        'HTTP_CLIENT_IP',
+        'REMOTE_ADDR',
+    );
+    foreach ( $headers as $header ) {
+        if ( ! empty( $_SERVER[ $header ] ) ) {
+            $ips = explode( ',', sanitize_text_field( wp_unslash( $_SERVER[ $header ] ) ) );
+            $ip  = trim( $ips[0] );
+            if ( filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) ) {
+                return $ip;
+            }
         }
     }
-    // Remove the pending approval plugins option from the database
-    delete_option('pending_approval_plugins');
+    // Fallback to REMOTE_ADDR even if private.
+    return isset( $_SERVER['REMOTE_ADDR'] ) ? sanitize_text_field( wp_unslash( $_SERVER['REMOTE_ADDR'] ) ) : '0.0.0.0';
 }
 
-// Disable daily plugin check
-// No cron job scheduling for daily checks
-// if (!wp_next_scheduled('daily_plugin_check_event')) {
-//    wp_schedule_event(time(), 'daily', 'daily_plugin_check_event');
-// }
-// add_action('daily_plugin_check_event', 'check_for_unauthorized_plugins');
+// ────────────────────────────────────────────────────────────────────
+// HELPER: Lightweight User-Agent parser (no external library needed).
+// ────────────────────────────────────────────────────────────────────
 
-// Prevent unauthorized user creation
-function prevent_unauthorized_user_creation($user_id) {
-    if (!current_user_can('create_users') && !get_option('users_can_register')) {
-        require_once(ABSPATH . 'wp-admin/includes/user.php');
-        wp_delete_user($user_id);
-        error_log("Unauthorized user creation blocked and user deleted: ID $user_id");
-    }
-}
-add_action('user_register', 'prevent_unauthorized_user_creation');
-
-// Prevent unauthorized plugin installation
-function prevent_unauthorized_plugin_installation($response, $hook_extra) {
-    if (isset($hook_extra['type']) && $hook_extra['type'] === 'plugin' && $hook_extra['action'] === 'install') {
-        if (!current_user_can('install_plugins')) {
-            error_log("Unauthorized plugin installation attempt blocked.");
-            return new WP_Error('unauthorized_install', 'You are not authorized to install plugins.');
-        }
-    }
-    return $response;
-}
-add_filter('upgrader_pre_install', 'prevent_unauthorized_plugin_installation', 10, 2);
-
-// Disable Theme and Plugin Editor
-if (!defined('DISALLOW_FILE_EDIT')) {
-    define('DISALLOW_FILE_EDIT', true);
-}
-
-// Disable PHP execution in the uploads directory
-function secure_uploads_directory() {
-    $upload_dir = wp_upload_dir();
-    $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
-
-    $rules = "<Files *.php>\n<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n</Files>";
-
-    if (!file_exists($htaccess_file)) {
-        file_put_contents($htaccess_file, $rules);
-    } else {
-        $content = file_get_contents($htaccess_file);
-        if (strpos($content, '<Files *.php>') === false) {
-            file_put_contents($htaccess_file, $rules . "\n" . $content);
-        }
-    }
-}
-register_activation_hook(__FILE__, 'secure_uploads_directory');
-
-// Revert PHP execution disabling in the uploads directory on deactivation
-function remove_secure_uploads_directory() {
-    $upload_dir = wp_upload_dir();
-    $htaccess_file = $upload_dir['basedir'] . '/.htaccess';
-
-    if (file_exists($htaccess_file)) {
-        $content = file_get_contents($htaccess_file);
-        $rules = "<Files *.php>\n<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n</Files>\n";
-        $new_content = str_replace($rules, '', $content);
-
-        // Also check if it was added without a trailing newline
-        $rules_no_newline = "<Files *.php>\n<IfModule mod_authz_core.c>\n    Require all denied\n</IfModule>\n<IfModule !mod_authz_core.c>\n    Order deny,allow\n    Deny from all\n</IfModule>\n</Files>";
-        $new_content = str_replace($rules_no_newline, '', $new_content);
-
-        // If the file is now empty or just whitespace, delete it
-        if (trim($new_content) === '') {
-            unlink($htaccess_file);
-        } else {
-            file_put_contents($htaccess_file, $new_content);
-        }
-    }
-}
-register_deactivation_hook(__FILE__, 'remove_secure_uploads_directory');
-
-// Disable XML-RPC
-if (get_option('psc_disable_xmlrpc', 'no') === 'yes') {
-    add_filter('xmlrpc_enabled', '__return_false');
-}
-
-// Prevent User Enumeration
-if (get_option('psc_prevent_enumeration', 'no') === 'yes') {
-    if (!is_admin()) {
-        add_action('template_redirect', 'psc_block_user_enumeration');
-    }
-    // Block REST API user enumeration
-    add_filter('rest_endpoints', 'psc_block_rest_user_enumeration');
-}
-
-function psc_block_user_enumeration() {
-    if (is_author() || (isset($_SERVER['QUERY_STRING']) && preg_match('/author=([0-9]*)/i', $_SERVER['QUERY_STRING']))) {
-        wp_redirect(home_url(), 301);
-        die();
-    }
-}
-
-function psc_block_rest_user_enumeration($endpoints) {
-    if (isset($endpoints['/wp/v2/users'])) {
-        unset($endpoints['/wp/v2/users']);
-    }
-    if (isset($endpoints['/wp/v2/users/(?P<id>[\d]+)'])) {
-        unset($endpoints['/wp/v2/users/(?P<id>[\d]+)']);
-    }
-    return $endpoints;
-}
-
-// Write .htaccess rules for Directory Browsing and wp-config.php protection
-function psc_update_root_htaccess() {
-    // Only attempt if we can find the home path and insert_with_markers is available
-    if (function_exists('get_home_path') && function_exists('insert_with_markers')) {
-        $home_path = get_home_path();
-        $htaccess_file = $home_path . '.htaccess';
-        $rules = array();
-
-        if (get_option('psc_disable_directory_browsing', 'no') === 'yes') {
-            $rules[] = 'Options -Indexes';
-        }
-
-        if (get_option('psc_protect_wpconfig', 'no') === 'yes') {
-            $rules[] = '<Files wp-config.php>';
-            $rules[] = '<IfModule mod_authz_core.c>';
-            $rules[] = '    Require all denied';
-            $rules[] = '</IfModule>';
-            $rules[] = '<IfModule !mod_authz_core.c>';
-            $rules[] = '    Order deny,allow';
-            $rules[] = '    Deny from all';
-            $rules[] = '</IfModule>';
-            $rules[] = '</Files>';
-        }
-
-        // Insert or remove the rules based on the options
-        if (!empty($rules)) {
-            insert_with_markers($htaccess_file, 'Plugin Security Check', $rules);
-        } else {
-            // Remove the markers completely if both are disabled
-            insert_with_markers($htaccess_file, 'Plugin Security Check', array());
-        }
-    }
-}
-// Hook into plugin activation and deactivation to apply/remove these rules safely
-register_activation_hook(__FILE__, 'psc_update_root_htaccess');
-
-function psc_remove_root_htaccess_rules() {
-    if (function_exists('get_home_path') && function_exists('insert_with_markers')) {
-        $home_path = get_home_path();
-        $htaccess_file = $home_path . '.htaccess';
-        insert_with_markers($htaccess_file, 'Plugin Security Check', array());
-    }
-}
-register_deactivation_hook(__FILE__, 'psc_remove_root_htaccess_rules');
-
-// Disable Application Passwords
-if (get_option('psc_disable_app_passwords', 'no') === 'yes') {
-    add_filter('wp_is_application_passwords_available', '__return_false');
-}
-
-// Restrict REST API to Authenticated Users Only
-if (get_option('psc_restrict_rest_api', 'no') === 'yes') {
-    add_filter('rest_authentication_errors', 'psc_restrict_rest_api_to_authenticated_users');
-}
-
-function psc_restrict_rest_api_to_authenticated_users($result) {
-    if (!empty($result)) {
+function aag_parse_user_agent( $ua ) {
+    $result = array(
+        'browser'         => 'Unknown',
+        'browser_version' => 'Unknown',
+        'os'              => 'Unknown',
+        'device_type'     => 'Desktop',
+    );
+    if ( empty( $ua ) || $ua === 'N/A' ) {
         return $result;
     }
-    if (!is_user_logged_in()) {
-        return new WP_Error('rest_not_logged_in', 'You are not currently logged in. The REST API is restricted to authenticated users.', array('status' => 401));
-    }
-    return $result;
-}
 
-// Run core checksum scan
-function psc_run_core_checksum_scan() {
-    global $wp_version;
-
-    // Remove any development suffixes like -RC1 or -alpha
-    $version = preg_replace('/-.*$/', '', $wp_version);
-    if (empty($version)) {
-        $version = get_bloginfo('version');
+    // Device type.
+    if ( preg_match( '/mobile|android|iphone|ipad|ipod|blackberry|windows phone/i', $ua ) ) {
+        $result['device_type'] = preg_match( '/ipad|tablet/i', $ua ) ? 'Tablet' : 'Mobile';
     }
 
-    $locale = get_locale();
-
-    // Fetch checksums from WP API
-    $response = wp_remote_get("https://api.wordpress.org/core/checksums/1.0/?version={$version}&locale={$locale}");
-    $body = wp_remote_retrieve_body($response);
-    $data = json_decode($body, true);
-
-    // Fallback to en_US if local translation checksums are missing
-    if (empty($data['checksums']) || empty($data['checksums'][$version])) {
-        $response = wp_remote_get("https://api.wordpress.org/core/checksums/1.0/?version={$version}&locale=en_US");
-        $body = wp_remote_retrieve_body($response);
-        $data = json_decode($body, true);
-    }
-
-    if (is_wp_error($response)) {
-        echo '<div class="error"><p>Failed to connect to WordPress.org API to fetch checksums.</p></div>';
-        return;
-    }
-
-    // If exact version fails, try to grab the latest minor release for that major version
-    $checksums = array();
-    if (!empty($data['checksums']) && is_array($data['checksums'])) {
-        if (isset($data['checksums'][$version])) {
-            $checksums = $data['checksums'][$version];
-        } else {
-            // Fallback: Just grab the first available version from the API response
-            // Since we queried specifically for the version, if they return anything, it's the closest match.
-            reset($data['checksums']);
-            $closest_version = key($data['checksums']);
-            if ($closest_version) {
-                $checksums = $data['checksums'][$closest_version];
-                echo '<div class="notice notice-warning"><p>Could not find exact checksums for ' . esc_html($version) . '. Falling back to ' . esc_html($closest_version) . '.</p></div>';
+    // OS detection.
+    $os_map = array(
+        'Windows NT 10'  => 'Windows 10/11',
+        'Windows NT 6.3' => 'Windows 8.1',
+        'Windows NT 6.2' => 'Windows 8',
+        'Windows NT 6.1' => 'Windows 7',
+        'Mac OS X'       => 'macOS',
+        'Android'        => 'Android',
+        'iPhone'         => 'iOS (iPhone)',
+        'iPad'           => 'iOS (iPad)',
+        'Linux'          => 'Linux',
+        'Ubuntu'         => 'Ubuntu',
+        'CrOS'           => 'Chrome OS',
+    );
+    foreach ( $os_map as $pattern => $name ) {
+        if ( stripos( $ua, $pattern ) !== false ) {
+            $result['os'] = $name;
+            // Try to extract Android / iOS version.
+            if ( $name === 'Android' && preg_match( '/Android ([0-9.]+)/i', $ua, $m ) ) {
+                $result['os'] = 'Android ' . $m[1];
+            } elseif ( in_array( $name, array( 'iOS (iPhone)', 'iOS (iPad)' ), true ) && preg_match( '/OS ([0-9_]+)/i', $ua, $m ) ) {
+                $result['os'] = str_replace( array( 'iPhone', 'iPad' ), 'iOS', $name ) . ' ' . str_replace( '_', '.', $m[1] );
             }
-        }
-    }
-
-    if (empty($checksums)) {
-        echo '<div class="error"><p>Could not retrieve checksums for WordPress version ' . esc_html($version) . '. This can happen if you are running an unofficial or beta version of WordPress.</p></div>';
-        return;
-    }
-    $modified_files = array();
-    $missing_files = array();
-
-    foreach ($checksums as $file => $expected_hash) {
-        $local_file_path = ABSPATH . $file;
-
-        // Skip wp-config-sample.php as it's often modified/deleted harmlessly
-        if ($file === 'wp-config-sample.php') {
-            continue;
-        }
-
-        if (!file_exists($local_file_path)) {
-            $missing_files[] = $file;
-        } else {
-            $local_hash = md5_file($local_file_path);
-            if ($local_hash !== $expected_hash) {
-                $modified_files[] = $file;
-            }
-        }
-    }
-
-    echo '<div class="notice notice-info" style="padding:15px; margin-top:20px;">';
-    echo '<h3>Scan Results for WordPress ' . esc_html($version) . '</h3>';
-
-    $has_issues = false;
-
-    if (!empty($modified_files)) {
-        $has_issues = true;
-        echo '<h4 style="color:red;">Modified Core Files:</h4><ul>';
-        foreach ($modified_files as $file) {
-            echo '<li><code>' . esc_html($file) . '</code></li>';
-        }
-        echo '</ul>';
-    }
-
-    if (!empty($missing_files)) {
-        $has_issues = true;
-        echo '<h4 style="color:orange;">Missing Core Files:</h4><ul>';
-        foreach ($missing_files as $file) {
-            echo '<li><code>' . esc_html($file) . '</code></li>';
-        }
-        echo '</ul>';
-    }
-
-    if (!$has_issues) {
-        echo '<p style="color:green; font-weight:bold;">Success! All WordPress core files match the official repository. No modifications detected.</p>';
-    } else {
-        echo '<div style="background:#fcebea; border-left:4px solid #dc3232; padding:10px; margin-top:20px;">';
-        echo '<p><strong>Warning:</strong> Core file modifications often indicate a hacked website. If you did not intentionally modify these files, you should repair your core files immediately.</p>';
-        echo '<form method="post" action="" onsubmit="return confirm(\'Are you sure you want to reinstall WordPress core? This will overwrite any custom modifications you have made to core files.\');">';
-        wp_nonce_field('psc_repair_core', 'psc_scanner_nonce');
-        echo '<input type="submit" name="repair_core" class="button button-primary" style="background:#dc3232; border-color:#dc3232;" value="Repair Core Files Now">';
-        echo '</form>';
-        echo '</div>';
-    }
-    echo '</div>';
-}
-
-// Reinstall WordPress Core to fix modified/missing files
-function psc_repair_core_files() {
-    // Make sure we have the required files loaded for the Upgrader
-    require_once(ABSPATH . 'wp-admin/includes/class-wp-upgrader.php');
-    require_once(ABSPATH . 'wp-admin/includes/update.php');
-
-    // Check if user has permission
-    if (!current_user_can('update_core')) {
-        echo '<div class="error"><p>You do not have sufficient permissions to update core files.</p></div>';
-        return;
-    }
-
-    echo '<div class="updated" style="padding:15px; margin-top:20px;">';
-    echo '<h3>Repairing Core Files...</h3>';
-
-    // We need to flush the update cache to ensure we get a download link
-    wp_version_check();
-
-    $current = get_site_transient('update_core');
-    if (!isset($current->updates) || !is_array($current->updates)) {
-        echo '<p>Could not find WordPress updates. Please try again later.</p>';
-        echo '</div>';
-        return;
-    }
-
-    // Find the update object for the current version to reinstall
-    $update = $current->updates[0];
-    foreach ($current->updates as $offer) {
-        if ($offer->response === 'reinstall') {
-            $update = $offer;
             break;
         }
     }
 
-    // Suppress normal upgrader output by using a quiet skin
-    if (!class_exists('PSC_Quiet_Upgrader_Skin')) {
-        class PSC_Quiet_Upgrader_Skin extends WP_Upgrader_Skin {
-            public function feedback($string, ...$args) { /* Quiet */ }
-            public function header() { /* Quiet */ }
-            public function footer() { /* Quiet */ }
+    // Browser detection (order matters: most specific first).
+    $browser_map = array(
+        'Edg'             => 'Microsoft Edge',
+        'OPR'             => 'Opera',
+        'Opera'           => 'Opera',
+        'Chrome'          => 'Google Chrome',
+        'Safari'          => 'Safari',
+        'Firefox'         => 'Mozilla Firefox',
+        'MSIE'            => 'Internet Explorer',
+        'Trident'         => 'Internet Explorer 11',
+        'SamsungBrowser'  => 'Samsung Browser',
+        'UCBrowser'       => 'UC Browser',
+    );
+    foreach ( $browser_map as $token => $name ) {
+        if ( stripos( $ua, $token ) !== false ) {
+            $result['browser'] = $name;
+            // Extract version number.
+            $version_token = ( $token === 'Trident' ) ? 'rv:' : $token . '/';
+            if ( preg_match( '#' . preg_quote( $version_token, '#' ) . '([0-9.]+)#i', $ua, $mv ) ) {
+                $result['browser_version'] = $mv[1];
+            }
+            break;
         }
     }
 
-    $skin = new PSC_Quiet_Upgrader_Skin();
-    $upgrader = new Core_Upgrader($skin);
+    return $result;
+}
 
-    $result = $upgrader->upgrade($update, array(
-        'allow_relaxed_file_ownership' => true,
-        'clear_update_cache' => true
-    ));
+// ────────────────────────────────────────────────────────────────────
+// HELPER: GeoIP lookup using ipapi.co with ip-api.com as fallback.
+// ────────────────────────────────────────────────────────────────────
 
-    if (is_wp_error($result)) {
-        echo '<p style="color:red;">Repair failed: ' . esc_html($result->get_error_message()) . '</p>';
-    } else {
-        echo '<p style="color:green; font-weight:bold;">Core files successfully repaired! WordPress has been reinstalled.</p>';
+function aag_geoip_lookup( $ip ) {
+    $defaults = array(
+        'country'   => 'Unknown',
+        'region'    => 'Unknown',
+        'city'      => 'Unknown',
+        'isp'       => 'Unknown',
+        'latitude'  => 'N/A',
+        'longitude' => 'N/A',
+        'timezone'  => 'N/A',
+    );
+
+    // Skip local / reserved IPs.
+    if ( in_array( $ip, array( '127.0.0.1', '::1' ), true )
+         || filter_var( $ip, FILTER_VALIDATE_IP, FILTER_FLAG_NO_PRIV_RANGE | FILTER_FLAG_NO_RES_RANGE ) === false ) {
+        return $defaults;
     }
-    echo '</div>';
-}
 
-// Disable File Mods (Plugin/Theme installations)
-if (get_option('psc_disallow_file_mods', 'no') === 'yes') {
-    if (!defined('DISALLOW_FILE_MODS')) {
-        define('DISALLOW_FILE_MODS', true);
+    $transient_key = 'aag_geo_' . md5( $ip );
+    $cached        = get_transient( $transient_key );
+    if ( $cached ) {
+        return $cached;
     }
-}
 
-// Hide WP Version
-if (get_option('psc_hide_wp_version', 'no') === 'yes') {
-    add_filter('the_generator', '__return_empty_string');
-    add_filter('style_loader_src', 'psc_remove_version_scripts_styles', 9999);
-    add_filter('script_loader_src', 'psc_remove_version_scripts_styles', 9999);
-}
-function psc_remove_version_scripts_styles($src) {
-    if (strpos($src, 'ver=')) {
-        $src = remove_query_arg('ver', $src);
-    }
-    return $src;
-}
-
-// --- Alerts and Monitoring ---
-
-function psc_get_alert_email() {
-    return get_option('admin_email');
-}
-
-// Alert on New Admin Users
-add_action('user_register', 'psc_alert_new_admin_user', 20);
-function psc_alert_new_admin_user($user_id) {
-    $user = get_userdata($user_id);
-    if ($user && in_array('administrator', (array) $user->roles)) {
-        $creator_ip = psc_get_client_ip();
-        $current_user = wp_get_current_user();
-        $is_authorized = ($current_user->exists() && in_array('administrator', (array) $current_user->roles));
-
-        if (!$is_authorized && !empty($creator_ip)) {
-            psc_block_ip($creator_ip, 'Auto-blocked for unauthorized creation of an administrator account.');
-        }
-
-        wp_mail(
-            psc_get_alert_email(),
-            '[Security Alert] New Administrator User Created',
-            "A new administrator user has been created on your site.\n\nUsername: {$user->user_login}\nEmail: {$user->user_email}\nDate: " . date('Y-m-d H:i:s')
-        );
-    }
-}
-
-// Alert on Privilege Escalation
-add_action('set_user_role', 'psc_alert_privilege_escalation', 10, 3);
-function psc_alert_privilege_escalation($user_id, $role, $old_roles) {
-    if ($role === 'administrator' && !in_array('administrator', (array) $old_roles)) {
-        $creator_ip = psc_get_client_ip();
-        $current_user = wp_get_current_user();
-        $is_authorized = ($current_user->exists() && in_array('administrator', (array) $current_user->roles));
-
-        if (!$is_authorized && !empty($creator_ip)) {
-            psc_block_ip($creator_ip, 'Auto-blocked for unauthorized privilege escalation to administrator.');
-        }
-
-        $user = get_userdata($user_id);
-        if ($user) {
-            wp_mail(
-                psc_get_alert_email(),
-                '[Security Alert] Privilege Escalation Detected',
-                "A user's privileges have been escalated to administrator.\n\nUsername: {$user->user_login}\nDate: " . date('Y-m-d H:i:s')
+    // Primary: ipapi.co (HTTPS).
+    $response = wp_remote_get(
+        'https://ipapi.co/' . rawurlencode( $ip ) . '/json/',
+        array( 'timeout' => 5, 'user-agent' => 'Admin-Approval-Guard/' . AAG_VERSION )
+    );
+    if ( ! is_wp_error( $response ) ) {
+        $data = json_decode( wp_remote_retrieve_body( $response ), true );
+        if ( ! empty( $data ) && empty( $data['error'] ) ) {
+            $result = array(
+                'country'   => $data['country_name']  ?? 'Unknown',
+                'region'    => $data['region']         ?? 'Unknown',
+                'city'      => $data['city']           ?? 'Unknown',
+                'isp'       => $data['org']            ?? 'Unknown',
+                'latitude'  => $data['latitude']       ?? 'N/A',
+                'longitude' => $data['longitude']      ?? 'N/A',
+                'timezone'  => $data['timezone']       ?? 'N/A',
             );
+            set_transient( $transient_key, $result, HOUR_IN_SECONDS * 24 );
+            return $result;
         }
     }
-}
 
-// Alert on Theme Change
-add_action('switch_theme', 'psc_alert_theme_change', 10, 3);
-function psc_alert_theme_change($new_name, $new_theme, $old_theme) {
-    wp_mail(
-        psc_get_alert_email(),
-        '[Security Alert] Theme Changed',
-        "The active theme has been changed.\n\nNew Theme: {$new_name}\nOld Theme: {$old_theme->name}\nDate: " . date('Y-m-d H:i:s')
+    // Fallback: ip-api.com (HTTPS).
+    $response = wp_remote_get(
+        'https://ip-api.com/json/' . rawurlencode( $ip ) . '?fields=status,country,regionName,city,isp,lat,lon,timezone',
+        array( 'timeout' => 5, 'user-agent' => 'Admin-Approval-Guard/' . AAG_VERSION )
     );
+    if ( ! is_wp_error( $response ) ) {
+        $data = json_decode( wp_remote_retrieve_body( $response ), true );
+        if ( ! empty( $data ) && isset( $data['status'] ) && $data['status'] === 'success' ) {
+            $result = array(
+                'country'   => $data['country']    ?? 'Unknown',
+                'region'    => $data['regionName'] ?? 'Unknown',
+                'city'      => $data['city']       ?? 'Unknown',
+                'isp'       => $data['isp']        ?? 'Unknown',
+                'latitude'  => $data['lat']        ?? 'N/A',
+                'longitude' => $data['lon']        ?? 'N/A',
+                'timezone'  => $data['timezone']   ?? 'N/A',
+            );
+            set_transient( $transient_key, $result, HOUR_IN_SECONDS * 24 );
+            return $result;
+        }
+    }
+
+    return $defaults;
 }
 
-// Alert on new plugin installation (already covered partially by the original plugin, but we can hook upgrader for real installs)
-add_action('upgrader_process_complete', 'psc_alert_plugin_install', 10, 2);
-function psc_alert_plugin_install($upgrader_object, $options) {
-    if ($options['action'] === 'install' && $options['type'] === 'plugin') {
-        $plugin_name = isset($upgrader_object->result['destination_name']) ? $upgrader_object->result['destination_name'] : 'Unknown';
-        wp_mail(
-            psc_get_alert_email(),
-            '[Security Alert] New Plugin Installed',
-            "A new plugin has been installed via the admin panel.\n\nPlugin: {$plugin_name}\nDate: " . date('Y-m-d H:i:s')
-        );
+// ────────────────────────────────────────────────────────────────────
+// HELPER: Detect how the user registered / request source.
+// ────────────────────────────────────────────────────────────────────
+
+function aag_detect_registration_source() {
+    if ( defined( 'REST_REQUEST' ) && REST_REQUEST ) {
+        return 'WordPress REST API';
     }
+    if ( defined( 'XMLRPC_REQUEST' ) && XMLRPC_REQUEST ) {
+        return 'XML-RPC';
+    }
+    if ( doing_action( 'woocommerce_created_customer' ) ) {
+        return 'WooCommerce Registration';
+    }
+    if ( isset( $_SERVER['REQUEST_URI'] ) ) {
+        $uri = sanitize_text_field( wp_unslash( $_SERVER['REQUEST_URI'] ) );
+        if ( strpos( $uri, 'wp-login.php' ) !== false ) {
+            return 'wp-login.php Registration Form';
+        }
+        if ( strpos( $uri, 'wp-admin' ) !== false ) {
+            return 'WordPress Admin Panel';
+        }
+        if ( strpos( $uri, 'register' ) !== false ) {
+            return 'Front-End Registration Form';
+        }
+    }
+    if ( wp_doing_cron() ) {
+        return 'WP-Cron';
+    }
+    if ( defined( 'WP_CLI' ) && WP_CLI ) {
+        return 'WP-CLI';
+    }
+    return 'Unknown / Direct';
 }
 
-// --- Malware & DB Scanner ---
+// ────────────────────────────────────────────────────────────────────
+// HELPER: Generate a cryptographically secure token.
+// ────────────────────────────────────────────────────────────────────
 
-function psc_run_database_checks() {
-    global $table_prefix;
-    echo '<div class="notice notice-info" style="padding:15px; margin-top:20px;">';
-    echo '<h3>Database Security Check</h3>';
-
-    if ($table_prefix === 'wp_') {
-        echo '<p style="color:red;"><strong>Warning:</strong> Your database prefix is set to the default <code>wp_</code>. This makes you vulnerable to automated SQL injection attacks. It is highly recommended to change it.</p>';
-    } else {
-        echo '<p style="color:green;"><strong>Protected:</strong> Your database prefix is not the default. Good job!</p>';
+function aag_generate_token() {
+    if ( function_exists( 'random_bytes' ) ) {
+        return bin2hex( random_bytes( AAG_TOKEN_LENGTH ) );
     }
-
-    $suspicious_options = psc_get_suspicious_db_options();
-    if (!empty($suspicious_options)) {
-        echo '<h4 style="color:red; margin-top: 15px;">Suspicious Database Options Found:</h4>';
-        echo '<p>The following options match known malware signatures. You can delete them here to clean your database.</p>';
-        echo '<table class="wp-list-table widefat fixed striped" style="margin-top:10px;">';
-        echo '<thead><tr><th>Option Name</th><th>Reason</th><th style="width:150px;">Action</th></tr></thead>';
-        echo '<tbody>';
-        foreach ($suspicious_options as $opt_name) {
-            echo '<tr>';
-            echo '<td><code>' . esc_html($opt_name) . '</code></td>';
-            echo '<td><span style="color:red;">Potential malicious payload detected</span></td>';
-            echo '<td>';
-            echo '<form method="post" action="" onsubmit="return confirm(\'Are you sure you want to permanently delete this option?\');">';
-            wp_nonce_field('psc_delete_option', 'psc_scanner_nonce');
-            echo '<input type="hidden" name="option_name" value="' . esc_attr($opt_name) . '">';
-            echo '<input type="submit" name="delete_db_option" class="button button-small button-link-delete" style="color:#a00;" value="Delete Option">';
-            echo '</form>';
-            echo '</td>';
-            echo '</tr>';
-        }
-        echo '</tbody></table>';
-    } else {
-        echo '<p style="color:green;"><strong>Clean:</strong> No suspicious payloads detected in the database options table.</p>';
-    }
-
-    echo '</div>';
+    // Fallback for older PHP (still good entropy via wp_generate_password).
+    return wp_generate_password( AAG_TOKEN_LENGTH * 2, false, false );
 }
 
-function psc_run_malware_scan($silent = false) {
-    $upload_dir = wp_upload_dir();
-    $scan_dirs = array(WP_PLUGIN_DIR, get_theme_root(), $upload_dir['basedir']);
+// ────────────────────────────────────────────────────────────────────
+// HELPER: Check if a user is in the pending queue.
+// ────────────────────────────────────────────────────────────────────
 
-    // Break up the strings so this file doesn't flag itself during the scan
-    $suspicious_patterns = array(
-        'eval' . '(base64' . '_decode',
-        'eval' . '($_POST',
-        'eval' . '($_GET',
-        'str' . '_rot13',
-        'gzinflate' . '(base64' . '_decode'
-    );
-
-    $found_issues = array();
-
-    foreach ($scan_dirs as $dir) {
-        if (!is_dir($dir)) continue;
-
-        $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
-        foreach ($iterator as $file) {
-            if ($file->isDir()) continue;
-            if (pathinfo($file->getFilename(), PATHINFO_EXTENSION) !== 'php') continue;
-
-            // Ignore common vendor/dependency directories which often contain these strings legitimately (e.g. polyfills, test mocks)
-            $path = $file->getPathname();
-            if (strpos($path, '/vendor/') !== false || strpos($path, '/node_modules/') !== false) continue;
-
-            $contents = @file_get_contents($file->getPathname());
-            if (!$contents) continue;
-
-            foreach ($suspicious_patterns as $pattern) {
-                // simple strpos check for basic malware heuristics
-                if (strpos($contents, $pattern) !== false) {
-                    $found_issues[] = array('file' => $file->getPathname(), 'pattern' => $pattern);
-                }
-            }
-        }
-    }
-
-    if (!$silent) {
-        echo '<div class="notice notice-info" style="padding:15px; margin-top:20px;">';
-        echo '<h3>Malware & Backdoor Heuristic Scan</h3>';
-
-        if (empty($found_issues)) {
-            echo '<p style="color:green; font-weight:bold;">Success! No obvious malicious PHP patterns found in plugins, themes, or uploads.</p>';
-        } else {
-            echo '<h4 style="color:red;">Suspicious Files Found:</h4><ul>';
-            foreach ($found_issues as $issue) {
-                echo '<li><code>' . esc_html($issue['file']) . '</code> (Matched: ' . esc_html($issue['pattern']) . ')</li>';
-            }
-            echo '</ul>';
-        }
-        echo '</div>';
-    }
-
-    return $found_issues;
+function aag_is_pending( $user_id ) {
+    return (bool) get_user_meta( $user_id, '_aag_pending', true );
 }
 
-// Scheduled Daily Malware Scan
-if (!wp_next_scheduled('psc_daily_malware_scan')) {
-    wp_schedule_event(time(), 'daily', 'psc_daily_malware_scan');
-}
-add_action('psc_daily_malware_scan', 'psc_scheduled_malware_scan');
+// ────────────────────────────────────────────────────────────────────
+// HELPER: Check if a given user ID is the authorized admin.
+//         The first administrator registered is considered the root admin.
+// ────────────────────────────────────────────────────────────────────
 
-function psc_scheduled_malware_scan() {
-    $issues = psc_run_malware_scan(true);
-    if (!empty($issues)) {
-        $body = "The Plugin Security Check daily scan found suspicious files:\n\n";
-        foreach ($issues as $issue) {
-            $body .= "- " . $issue['file'] . " (Pattern: " . $issue['pattern'] . ")\n";
-        }
-        wp_mail(psc_get_alert_email(), '[Security Alert] Malware Scan Detected Issues', $body);
-    }
-}
-
-// --- Advanced Missing Features ---
-
-// Scheduled Advanced Checks
-if (!wp_next_scheduled('psc_daily_advanced_scan')) {
-    wp_schedule_event(time(), 'daily', 'psc_daily_advanced_scan');
-}
-add_action('psc_daily_advanced_scan', 'psc_scheduled_advanced_scan');
-
-function psc_scheduled_advanced_scan() {
-    $alerts = array();
-
-    // Check 1: Suspicious Cron Jobs
-    $crons = _get_cron_array();
-    $suspicious_crons = array();
-    if (is_array($crons)) {
-        foreach ($crons as $timestamp => $cronhooks) {
-            foreach ($cronhooks as $hook => $keys) {
-                // If a cron job contains eval or base64 or doesn't match standard patterns
-                if (strpos($hook, 'eval(') !== false || strpos($hook, 'base64_decode') !== false) {
-                    $suspicious_crons[] = $hook;
-                }
-            }
-        }
-    }
-    if (!empty($suspicious_crons)) {
-        $alerts[] = "Suspicious Cron Jobs Detected:\n- " . implode("\n- ", $suspicious_crons);
-    }
-
-    // Check 2: Unauthorized Admin Accounts
-    $admin_users = get_users(array('role' => 'administrator'));
-    $known_admins = get_option('psc_known_admins', array());
-    $unknown_admins = array();
-
-    // Initialize known admins if empty (first run)
-    if (empty($known_admins)) {
-        foreach ($admin_users as $admin) {
-            $known_admins[] = $admin->ID;
-        }
-        update_option('psc_known_admins', $known_admins);
-    } else {
-        foreach ($admin_users as $admin) {
-            if (!in_array($admin->ID, $known_admins)) {
-                $unknown_admins[] = $admin->user_login;
-                // Auto-lock suspicious users
-                $user = new WP_User($admin->ID);
-                $user->remove_role('administrator');
-                $user->add_role('subscriber');
-                update_user_meta($admin->ID, 'psc_account_locked', true);
-            }
-        }
-    }
-    if (!empty($unknown_admins)) {
-        $alerts[] = "Unauthorized Admin Accounts Detected & Demoted to Subscriber:\n- " . implode("\n- ", $unknown_admins);
-    }
-
-    // Check 3: Suspicious DB Options
-    $suspicious_options = psc_get_suspicious_db_options();
-    if (!empty($suspicious_options)) {
-        $alerts[] = "Suspicious Database Options Detected (Potential Malicious Payloads):";
-        foreach ($suspicious_options as $opt_name) {
-            $alerts[] = "- " . $opt_name;
-        }
-    }
-
-    // Check 4: Modified Plugin/Theme Files (Checksum baseline)
-    $current_plugins_hash = psc_generate_directory_hash(WP_PLUGIN_DIR);
-    $current_themes_hash = psc_generate_directory_hash(get_theme_root());
-
-    $stored_plugins_hash = get_option('psc_plugins_baseline_hash', array());
-    $stored_themes_hash = get_option('psc_themes_baseline_hash', array());
-
-    // Handle backwards compatibility if it was previously a string
-    if (!is_array($stored_plugins_hash)) $stored_plugins_hash = array();
-    if (!is_array($stored_themes_hash)) $stored_themes_hash = array();
-
-    if (empty($stored_plugins_hash)) {
-        update_option('psc_plugins_baseline_hash', $current_plugins_hash, false);
-    } else {
-        $plugin_report = psc_compare_file_hashes($stored_plugins_hash, $current_plugins_hash, 'Plugin');
-        if ($plugin_report) {
-            $alerts[] = $plugin_report;
-            // Update baseline so we don't alert repeatedly for the same change
-            update_option('psc_plugins_baseline_hash', $current_plugins_hash, false);
-        }
-    }
-
-    if (empty($stored_themes_hash)) {
-        update_option('psc_themes_baseline_hash', $current_themes_hash, false);
-    } else {
-        $theme_report = psc_compare_file_hashes($stored_themes_hash, $current_themes_hash, 'Theme');
-        if ($theme_report) {
-            $alerts[] = $theme_report;
-            update_option('psc_themes_baseline_hash', $current_themes_hash, false);
-        }
-    }
-
-    if (!empty($alerts)) {
-        wp_mail(
-            psc_get_alert_email(),
-            '[CRITICAL Security Alert] Advanced Malware & DB Scan',
-            "The daily advanced scan detected severe security risks on your website:\n\n" . implode("\n\n", $alerts)
-        );
-    }
-}
-
-function psc_generate_directory_hash($dir) {
-    if (!is_dir($dir)) return array();
-    $files = array();
-    $iterator = new RecursiveIteratorIterator(new RecursiveDirectoryIterator($dir));
-    foreach ($iterator as $file) {
-        if ($file->isDir()) continue;
-        $path = $file->getPathname();
-        $files[$path] = md5_file($path);
-    }
-    return $files;
-}
-
-function psc_compare_file_hashes($old_hashes, $new_hashes, $type) {
-    if (!is_array($old_hashes) || !is_array($new_hashes)) return false;
-
-    $added = array();
-    $deleted = array();
-    $modified = array();
-
-    foreach ($new_hashes as $file => $hash) {
-        if (!isset($old_hashes[$file])) {
-            $added[] = $file;
-        } elseif ($old_hashes[$file] !== $hash) {
-            $modified[] = $file;
-        }
-    }
-
-    foreach ($old_hashes as $file => $hash) {
-        if (!isset($new_hashes[$file])) {
-            $deleted[] = $file;
-        }
-    }
-
-    if (empty($added) && empty($deleted) && empty($modified)) {
+function aag_is_authorized_admin( $user_id ) {
+    if ( ! $user_id ) {
         return false;
     }
-
-    $report = "{$type} files have been modified outside of standard updates!\n";
-    if (!empty($added)) {
-        $report .= "\n[ADDED FILES]\n- " . implode("\n- ", $added) . "\n";
+    $user = get_userdata( $user_id );
+    if ( ! $user ) {
+        return false;
     }
-    if (!empty($modified)) {
-        $report .= "\n[MODIFIED FILES]\n- " . implode("\n- ", $modified) . "\n";
-    }
-    if (!empty($deleted)) {
-        $report .= "\n[DELETED FILES]\n- " . implode("\n- ", $deleted) . "\n";
-    }
-
-    return $report;
+    // Must actually have manage_options AND not be pending.
+    return user_can( $user_id, 'manage_options' ) && ! aag_is_pending( $user_id );
 }
 
-// Update baselines when admins intentionally update plugins/themes
-add_action('upgrader_process_complete', 'psc_update_baselines_on_upgrade', 10, 2);
-function psc_update_baselines_on_upgrade($upgrader_object, $options) {
-    if ($options['type'] === 'plugin') {
-        update_option('psc_plugins_baseline_hash', psc_generate_directory_hash(WP_PLUGIN_DIR), false);
-    } elseif ($options['type'] === 'theme') {
-        update_option('psc_themes_baseline_hash', psc_generate_directory_hash(get_theme_root()), false);
-    }
-}
+// ────────────────────────────────────────────────────────────────────
+// NOTIFICATION EMAIL
+// ────────────────────────────────────────────────────────────────────
 
+function aag_send_notification_email( $user, $meta, $approve_token, $reject_token, $reason ) {
+    $approve_url = add_query_arg(
+        array(
+            'aag_action' => 'approve',
+            'user_id'    => $user->ID,
+            'token'      => $approve_token,
+        ),
+        home_url( '/' )
+    );
+    $reject_url  = add_query_arg(
+        array(
+            'aag_action' => 'reject',
+            'user_id'    => $user->ID,
+            'token'      => $reject_token,
+        ),
+        home_url( '/' )
+    );
+    $admin_panel_url = admin_url( 'admin.php?page=aag-admin-approvals' );
 
-// Helper to fetch genuinely suspicious database options
-function psc_get_suspicious_db_options() {
-    global $wpdb;
+    $reason_map = array(
+        'new_registration_as_admin'  => 'New User Registration with Administrator Role',
+        'privilege_escalation_attempt' => 'Privilege Escalation Attempt (Role Changed to Administrator)',
+        'rest_api_admin_create'      => 'REST API Administrator Creation Attempt',
+        'super_admin_grant'          => 'Super-Admin Grant Attempt (Multisite)',
+    );
+    $reason_label = $reason_map[ $reason ] ?? ucwords( str_replace( '_', ' ', $reason ) );
 
-    // Whitelist common safe prefixes to reduce processing
-    $whitelist_prefixes = array('_transient_timeout_', '_site_transient_timeout_');
-
-    // Broad SQL query to grab potentially risky options (we will filter in PHP)
-    // We target transients, site transients, and other options that might hold serialized payloads
-    $query = "SELECT option_name, option_value FROM {$wpdb->options} WHERE
-             option_value LIKE '%eval(%' OR
-             option_value LIKE '%base64_decode%' OR
-             option_value LIKE '%gzinflate%' OR
-             option_value LIKE '%system(%' OR
-             option_value LIKE '%exec(%' OR
-             option_value LIKE '%shell_exec(%' OR
-             option_value LIKE '%passthru(%' OR
-             LENGTH(option_value) > 10000"; // Flag unusually large options for heuristic check
-
-    $results = $wpdb->get_results($query);
-    $suspicious = array();
-
-    if (empty($results)) return $suspicious;
-
-    $malware_patterns = array(
-        '/eval\s*\(\s*base64_decode/i',
-        '/eval\s*\(\s*\$_(POST|GET|REQUEST|COOKIE)/i',
-        '/gzinflate\s*\(\s*base64_decode/i',
-        '/system\s*\(\s*\$_(POST|GET)/i',
-        '/exec\s*\(\s*\$_(POST|GET)/i',
-        '/passthru\s*\(\s*\$_(POST|GET)/i',
-        '/shell_exec\s*\(/i',
-        '/(?:[a-zA-Z0-9+\/]{4}){100,}(?:[a-zA-Z0-9+\/]{2}==|[a-zA-Z0-9+\/]{3}=)?/' // Very long base64 strings
+    $subject = sprintf(
+        '[SECURITY ALERT] Admin Approval Required — %s — %s',
+        $meta['username'],
+        get_bloginfo( 'name' )
     );
 
-    foreach ($results as $row) {
-        $name = $row->option_name;
-        $val = $row->option_value;
+    /* Build a detailed plain-text email body. */
+    $lines   = array();
+    $lines[] = '════════════════════════════════════════════════════';
+    $lines[] = '  ADMIN APPROVAL GUARD — ACTION REQUIRED';
+    $lines[] = '  ' . get_bloginfo( 'name' ) . ' (' . home_url() . ')';
+    $lines[] = '════════════════════════════════════════════════════';
+    $lines[] = '';
+    $lines[] = 'ALERT TYPE : ' . $reason_label;
+    $lines[] = 'ALERT TIME : ' . gmdate( 'Y-m-d H:i:s' ) . ' UTC';
+    $lines[] = '';
+    $lines[] = '────── USER DETAILS ──────';
+    $lines[] = 'Full Name        : ' . $meta['full_name'];
+    $lines[] = 'Username         : ' . $meta['username'];
+    $lines[] = 'Email Address    : ' . $meta['email'];
+    $lines[] = 'Phone Number     : ' . $meta['phone'];
+    $lines[] = 'Website          : ' . $meta['website'];
+    $lines[] = 'Nickname         : ' . $meta['nickname'];
+    $lines[] = 'User Description : ' . $meta['description'];
+    $lines[] = 'Locale           : ' . $meta['locale'];
+    $lines[] = 'Roles Before     : ' . $meta['roles_before'];
+    $lines[] = 'Registered At    : ' . $meta['registered_at'];
+    $lines[] = '';
+    $lines[] = '────── REQUEST DETAILS ──────';
+    $lines[] = 'Request Time     : ' . $meta['request_time'];
+    $lines[] = 'IP Address       : ' . $meta['ip_address'];
+    $lines[] = 'Request Source   : ' . $meta['source'];
+    $lines[] = 'HTTP Method      : ' . $meta['http_method'];
+    $lines[] = 'Request URI      : ' . $meta['request_uri'];
+    $lines[] = 'Referrer URL     : ' . $meta['referrer'];
+    $lines[] = '';
+    $lines[] = '────── DEVICE & BROWSER ──────';
+    $lines[] = 'Browser          : ' . $meta['browser'] . ' ' . $meta['browser_ver'];
+    $lines[] = 'Operating System : ' . $meta['os'];
+    $lines[] = 'Device Type      : ' . $meta['device_type'];
+    $lines[] = 'User Agent       : ' . $meta['user_agent'];
+    $lines[] = '';
+    $lines[] = '────── GEOLOCATION (IP-BASED) ──────';
+    $lines[] = 'Country          : ' . $meta['country'];
+    $lines[] = 'Region           : ' . $meta['region'];
+    $lines[] = 'City             : ' . $meta['city'];
+    $lines[] = 'ISP / Network    : ' . $meta['isp'];
+    $lines[] = 'Latitude         : ' . $meta['latitude'];
+    $lines[] = 'Longitude        : ' . $meta['longitude'];
+    $lines[] = 'Timezone         : ' . $meta['timezone'];
+    $lines[] = '';
+    $lines[] = '════════════════════════════════════════════════════';
+    $lines[] = '  ACTION REQUIRED — Please approve or reject below.';
+    $lines[] = '  The user will have NO admin access until you act.';
+    $lines[] = '════════════════════════════════════════════════════';
+    $lines[] = '';
+    $lines[] = '✅  APPROVE (grant administrator role):';
+    $lines[] = $approve_url;
+    $lines[] = '';
+    $lines[] = '❌  REJECT (keep as subscriber / remove):';
+    $lines[] = $reject_url;
+    $lines[] = '';
+    $lines[] = '🔐  Or manage all pending requests in your admin panel:';
+    $lines[] = $admin_panel_url;
+    $lines[] = '';
+    $lines[] = '────────────────────────────────────────────────────';
+    $lines[] = 'This is an automated alert from Admin Approval Guard.';
+    $lines[] = 'Do NOT share the above approval/rejection links.';
+    $lines[] = 'They are single-use tokens valid for one action only.';
+    $lines[] = '────────────────────────────────────────────────────';
 
-        // Skip explicitly whitelisted prefixes
-        $skip = false;
-        foreach ($whitelist_prefixes as $prefix) {
-            if (strpos($name, $prefix) === 0) {
-                $skip = true;
-                break;
-            }
-        }
-        if ($skip) continue;
+    $headers = array(
+        'Content-Type: text/plain; charset=UTF-8',
+        'X-Priority: 1',
+        'X-Mailer: Admin-Approval-Guard/' . AAG_VERSION,
+    );
 
-        // Apply strict heuristics
-        $is_malicious = false;
-        foreach ($malware_patterns as $pattern) {
-            if (preg_match($pattern, $val)) {
-                $is_malicious = true;
-                break;
-            }
-        }
-
-        if ($is_malicious) {
-            $suspicious[] = $name;
-        }
-    }
-
-    return $suspicious;
+    wp_mail( AAG_NOTIFY_EMAIL, $subject, implode( "\n", $lines ), $headers );
 }
 
-// --- Content Approval System ---
+// ────────────────────────────────────────────────────────────────────
+// EMAIL LINK HANDLER (init hook — processes approve/reject clicks).
+// ────────────────────────────────────────────────────────────────────
 
-// Intercept post publishing for non-admins
-if (get_option('psc_require_post_approval', 'no') === 'yes') {
-    add_filter('wp_insert_post_data', 'psc_require_admin_approval_for_posts', 10, 2);
-}
-
-function psc_require_admin_approval_for_posts($data, $postarr) {
-    // We only care about standard posts (blogs)
-    if ($data['post_type'] !== 'post') {
-        return $data;
-    }
-
-    // If the user is trying to publish or schedule the post
-    if (in_array($data['post_status'], array('publish', 'future'))) {
-
-        // Bypass the check if this is an automated WP-Cron job (e.g., publishing a previously scheduled post by an admin)
-        if (defined('DOING_CRON') && DOING_CRON) {
-            return $data;
-        }
-
-        if (function_exists('wp_get_current_user')) {
-            $user = wp_get_current_user();
-
-            // If user is not logged in (e.g. REST API exploit) or is not an administrator
-            if (!$user->exists() || !in_array('administrator', (array) $user->roles)) {
-
-                // Force the post back to pending review
-                $data['post_status'] = 'pending';
-
-                // Note: We don't send the email here because this filter runs multiple times
-                // We use transition_post_status for the email alert.
-            }
-        }
-    }
-
-    return $data;
-}
-
-// Alert admin when a post requires approval
-if (get_option('psc_require_post_approval', 'no') === 'yes') {
-    add_action('transition_post_status', 'psc_alert_pending_post', 10, 3);
-}
-
-function psc_alert_pending_post($new_status, $old_status, $post) {
-    if ($post->post_type !== 'post') {
+add_action( 'init', 'aag_handle_email_action' );
+function aag_handle_email_action() {
+    if ( ! isset( $_GET['aag_action'], $_GET['user_id'], $_GET['token'] ) ) {
         return;
     }
 
-    // Only alert when transitioning to pending (usually from draft, auto-draft, or a blocked publish attempt)
-    if ($new_status === 'pending' && $old_status !== 'pending') {
+    $action  = sanitize_key( wp_unslash( $_GET['aag_action'] ) );
+    $user_id = absint( wp_unslash( $_GET['user_id'] ) );
+    $token   = sanitize_text_field( wp_unslash( $_GET['token'] ) );
 
-        $author = get_userdata($post->post_author);
-        $author_name = $author ? $author->user_login : 'Unknown User';
-
-        $edit_link = admin_url('post.php?action=edit&post=' . $post->ID);
-
-        $subject = '[Security Alert] Blog Post Requires Approval';
-        $message = "A new blog post has been submitted and requires administrator approval before it can be published.\n\n";
-        $message .= "Title: {$post->post_title}\n";
-        $message .= "Author: {$author_name}\n\n";
-        $message .= "You can review and publish this post here:\n{$edit_link}";
-
-        wp_mail(psc_get_alert_email(), $subject, $message);
+    if ( ! in_array( $action, array( 'approve', 'reject' ), true ) ) {
+        return;
     }
-}
 
-// --- IP Blocking System ---
-
-function psc_get_client_ip() {
-    $ip = '';
-    if (isset($_SERVER['HTTP_CLIENT_IP'])) {
-        $ip = sanitize_text_field($_SERVER['HTTP_CLIENT_IP']);
-    } elseif (isset($_SERVER['HTTP_X_FORWARDED_FOR'])) {
-        $ip = sanitize_text_field($_SERVER['HTTP_X_FORWARDED_FOR']);
-        $ip = explode(',', $ip)[0]; // take the first IP
-    } elseif (isset($_SERVER['REMOTE_ADDR'])) {
-        $ip = sanitize_text_field($_SERVER['REMOTE_ADDR']);
-    }
-    return trim($ip);
-}
-
-function psc_block_ip($ip, $remark = '') {
-    $blocked_ips = get_option('psc_blocked_ips', array());
-    if (!isset($blocked_ips[$ip])) {
-        $blocked_ips[$ip] = array(
-            'remark' => $remark,
-            'time' => current_time('mysql')
+    // Verify the acting user is the authorized admin.
+    if ( ! is_user_logged_in() || ! aag_is_authorized_admin( get_current_user_id() ) ) {
+        wp_die(
+            esc_html__( 'You must be logged in as the authorized administrator to perform this action.', 'admin-approval-guard' ),
+            esc_html__( 'Unauthorized', 'admin-approval-guard' ),
+            array( 'response' => 403 )
         );
-        update_option('psc_blocked_ips', $blocked_ips, false);
-    }
-}
-
-function psc_unblock_ip($ip) {
-    $blocked_ips = get_option('psc_blocked_ips', array());
-    if (isset($blocked_ips[$ip])) {
-        unset($blocked_ips[$ip]);
-        update_option('psc_blocked_ips', $blocked_ips, false);
-    }
-}
-
-// Enforce IP blocks early in the WordPress lifecycle
-add_action('plugins_loaded', 'psc_enforce_ip_blocks', 1);
-function psc_enforce_ip_blocks() {
-    $client_ip = psc_get_client_ip();
-    if (empty($client_ip)) return;
-
-    $blocked_ips = get_option('psc_blocked_ips', array());
-    if (isset($blocked_ips[$client_ip])) {
-        header('HTTP/1.1 403 Forbidden');
-        die('Your IP address has been blocked for security reasons.');
-    }
-}
-
-// Post Creation Monitor
-if (get_option('psc_enable_post_monitor', 'no') === 'yes') {
-    // Priority 11 so it runs after our existing approval system
-    add_filter('wp_insert_post_data', 'psc_post_creation_monitor_filter', 11, 2);
-}
-
-function psc_post_creation_monitor_filter($data, $postarr) {
-    if ($data['post_type'] !== 'post') {
-        return $data;
     }
 
-    // Do not interfere if an administrator is the one publishing/updating the post.
-    // This solves the "Impossible to Approve" infinite loop problem.
-    if (function_exists('wp_get_current_user')) {
-        $user = wp_get_current_user();
-        if ($user->exists() && in_array('administrator', (array) $user->roles)) {
-            return $data;
+    $pending = get_option( AAG_OPTION_PENDING, array() );
+    $token_hash = wp_hash( $token );
+
+    $found = false;
+    foreach ( $pending as &$entry ) {
+        if ( (int) $entry['user_id'] !== $user_id || $entry['status'] !== 'pending' ) {
+            continue;
+        }
+        // Match against the correct token hash.
+        $valid = ( $action === 'approve' && hash_equals( $entry['approve_token'], $token_hash ) )
+               || ( $action === 'reject' && hash_equals( $entry['reject_token'], $token_hash ) );
+
+        if ( $valid ) {
+            $found = true;
+            if ( $action === 'approve' ) {
+                aag_approve_user( $user_id, $entry );
+                $entry['status'] = 'approved';
+                $entry['actioned_by'] = get_current_user_id();
+                $entry['actioned_at'] = current_time( 'timestamp', true );
+            } else {
+                aag_reject_user( $user_id, $entry );
+                $entry['status'] = 'rejected';
+                $entry['actioned_by'] = get_current_user_id();
+                $entry['actioned_at'] = current_time( 'timestamp', true );
+            }
+            // Invalidate both tokens after use.
+            $entry['approve_token'] = '';
+            $entry['reject_token']  = '';
+            break;
+        }
+        unset( $entry );
+    }
+    unset( $entry );
+
+    update_option( AAG_OPTION_PENDING, $pending, 'no' );
+
+    if ( ! $found ) {
+        wp_die(
+            esc_html__( 'Invalid or already-used token. This link may have expired or already been actioned.', 'admin-approval-guard' ),
+            esc_html__( 'Token Invalid', 'admin-approval-guard' ),
+            array( 'response' => 400 )
+        );
+    }
+
+    $label = ( $action === 'approve' ) ? 'approved' : 'rejected';
+    $user  = get_userdata( $user_id );
+    $uname = $user ? $user->user_login : "(ID: $user_id)";
+
+    wp_die(
+        sprintf(
+            '<h2 style="font-family:sans-serif">✅ Action Recorded</h2>
+            <p style="font-family:sans-serif">User <strong>%s</strong> has been <strong>%s</strong> successfully.</p>
+            <p style="font-family:sans-serif"><a href="%s">← Return to Admin Panel</a></p>',
+            esc_html( $uname ),
+            esc_html( $label ),
+            esc_url( admin_url( 'admin.php?page=aag-admin-approvals' ) )
+        ),
+        esc_html__( 'Action Complete', 'admin-approval-guard' ),
+        array( 'response' => 200 )
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// APPROVE: Grant admin role.
+// ────────────────────────────────────────────────────────────────────
+
+function aag_approve_user( $user_id, $entry ) {
+    $user = get_userdata( $user_id );
+    if ( ! $user ) {
+        return;
+    }
+
+    // Signal to the set_user_role hook that this is an authorized change.
+    $GLOBALS['aag_approving_user'] = true;
+    $user->set_role( 'administrator' );
+    $GLOBALS['aag_approving_user'] = false;
+
+    delete_user_meta( $user_id, '_aag_pending' );
+
+    // Register this user in the approved list so the integrity check
+    // does not flag them as an unauthorized admin.
+    $approved_ids = get_option( AAG_OPTION_APPROVED, array() );
+    if ( ! is_array( $approved_ids ) ) {
+        $approved_ids = array();
+    }
+    if ( ! in_array( (int) $user_id, $approved_ids, true ) ) {
+        $approved_ids[] = (int) $user_id;
+        update_option( AAG_OPTION_APPROVED, $approved_ids, 'no' );
+    }
+
+    aag_log(
+        'admin_approved',
+        'info',
+        sprintf( 'User ID %d (%s) APPROVED for administrator role by user ID %d.', $user_id, $user->user_login, get_current_user_id() ),
+        $user_id
+    );
+
+    // Notify the approved user.
+    wp_mail(
+        $user->user_email,
+        sprintf( '[%s] Your administrator access has been approved', get_bloginfo( 'name' ) ),
+        sprintf(
+            "Hello %s,\n\nYour request for administrator access on %s has been approved.\n\nYou can now log in at: %s\n\nRegards,\n%s",
+            $user->display_name,
+            get_bloginfo( 'name' ),
+            wp_login_url(),
+            get_bloginfo( 'name' )
+        )
+    );
+}
+
+
+// ────────────────────────────────────────────────────────────────────
+// REJECT: Keep user as subscriber, optionally delete.
+// ────────────────────────────────────────────────────────────────────
+
+function aag_reject_user( $user_id, $entry ) {
+    $user = get_userdata( $user_id );
+    if ( ! $user ) {
+        return;
+    }
+
+    // Keep the account but ensure it stays at subscriber level.
+    $user->set_role( 'subscriber' );
+    delete_user_meta( $user_id, '_aag_pending' );
+
+    aag_log(
+        'admin_rejected',
+        'warning',
+        sprintf( 'User ID %d (%s) REJECTED for administrator role by user ID %d. Account kept as subscriber.', $user_id, $user->user_login, get_current_user_id() ),
+        $user_id
+    );
+
+    // Notify the rejected user.
+    wp_mail(
+        $user->user_email,
+        sprintf( '[%s] Your administrator access request was declined', get_bloginfo( 'name' ) ),
+        sprintf(
+            "Hello %s,\n\nYour request for administrator access on %s has been declined.\n\nIf you believe this is an error, please contact the site administrator.\n\nRegards,\n%s",
+            $user->display_name,
+            get_bloginfo( 'name' ),
+            get_bloginfo( 'name' )
+        )
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ADMIN MENU
+// ────────────────────────────────────────────────────────────────────
+
+add_action( 'admin_menu', 'aag_register_menu' );
+function aag_register_menu() {
+    add_menu_page(
+        esc_html__( 'Admin Approval Guard', 'admin-approval-guard' ),
+        esc_html__( 'Admin Approvals', 'admin-approval-guard' ),
+        'manage_options',
+        'aag-admin-approvals',
+        'aag_render_admin_page',
+        'dashicons-shield-alt',
+        3
+    );
+    
+    // Add submenus
+    add_submenu_page(
+        'aag-admin-approvals',
+        esc_html__( 'Dashboard', 'admin-approval-guard' ),
+        esc_html__( 'Dashboard', 'admin-approval-guard' ),
+        'manage_options',
+        'aag-admin-approvals',
+        'aag_render_admin_page'
+    );
+
+    add_submenu_page(
+        'aag-admin-approvals',
+        esc_html__( 'Settings', 'admin-approval-guard' ),
+        esc_html__( 'Settings', 'admin-approval-guard' ),
+        'manage_options',
+        'aag-settings',
+        'aag_render_settings_page'
+    );
+
+    add_submenu_page(
+        'aag-admin-approvals',
+        esc_html__( '404 Redirect Logs', 'admin-approval-guard' ),
+        esc_html__( '404 Redirect Logs', 'admin-approval-guard' ),
+        'manage_options',
+        'aag-404-logs',
+        'aag_render_404_logs_page'
+    );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ADMIN PAGE — Handle form actions and render UI.
+// ────────────────────────────────────────────────────────────────────
+
+function aag_render_admin_page() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_die( esc_html__( 'You do not have permission to view this page.', 'admin-approval-guard' ) );
+    }
+
+    // ── Handle panel form actions ──
+    if ( isset( $_POST['aag_panel_action'], $_POST['aag_panel_nonce'], $_POST['aag_target_user_id'] ) ) {
+        if ( ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['aag_panel_nonce'] ) ), 'aag_panel_action' ) ) {
+            wp_die( esc_html__( 'Security check failed.', 'admin-approval-guard' ) );
+        }
+
+        $panel_action = sanitize_key( wp_unslash( $_POST['aag_panel_action'] ) );
+        $target_id    = absint( wp_unslash( $_POST['aag_target_user_id'] ) );
+        $pending      = get_option( AAG_OPTION_PENDING, array() );
+
+        foreach ( $pending as &$entry ) {
+            if ( (int) $entry['user_id'] !== $target_id || $entry['status'] !== 'pending' ) {
+                continue;
+            }
+            if ( $panel_action === 'approve' ) {
+                aag_approve_user( $target_id, $entry );
+                $entry['status']      = 'approved';
+                $entry['actioned_by'] = get_current_user_id();
+                $entry['actioned_at'] = current_time( 'timestamp', true );
+                // Invalidate tokens.
+                $entry['approve_token'] = '';
+                $entry['reject_token']  = '';
+                echo '<div class="notice notice-success"><p>' . esc_html__( 'User approved successfully.', 'admin-approval-guard' ) . '</p></div>';
+            } elseif ( $panel_action === 'reject' ) {
+                aag_reject_user( $target_id, $entry );
+                $entry['status']      = 'rejected';
+                $entry['actioned_by'] = get_current_user_id();
+                $entry['actioned_at'] = current_time( 'timestamp', true );
+                $entry['approve_token'] = '';
+                $entry['reject_token']  = '';
+                echo '<div class="notice notice-warning"><p>' . esc_html__( 'User rejected. Account remains as subscriber.', 'admin-approval-guard' ) . '</p></div>';
+            } elseif ( $panel_action === 'revoke' ) {
+                // Revoke existing administrator.
+                $user = get_userdata( $target_id );
+                if ( $user ) {
+                    $user->set_role( 'subscriber' );
+                    aag_log( 'admin_revoked', 'critical', sprintf( 'Administrator privileges REVOKED for user ID %d (%s) by user ID %d.', $target_id, $user->user_login, get_current_user_id() ), $target_id );
+                }
+                echo '<div class="notice notice-warning"><p>' . esc_html__( 'Administrator privileges revoked.', 'admin-approval-guard' ) . '</p></div>';
+            }
+            break;
+        }
+        unset( $entry );
+        update_option( AAG_OPTION_PENDING, $pending, 'no' );
+    }
+
+    // ── Clear logs ──
+    if ( isset( $_POST['aag_clear_logs'], $_POST['aag_clear_logs_nonce'] ) ) {
+        if ( wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['aag_clear_logs_nonce'] ) ), 'aag_clear_logs' ) ) {
+            update_option( AAG_OPTION_LOG, array(), 'no' );
+            echo '<div class="notice notice-success"><p>' . esc_html__( 'Audit logs cleared.', 'admin-approval-guard' ) . '</p></div>';
         }
     }
 
-    // We only need to check if the post is trying to be published/scheduled and is not already pending
-    if (in_array($data['post_status'], array('publish', 'future'))) {
+    $active_tab = isset( $_GET['tab'] ) ? sanitize_key( wp_unslash( $_GET['tab'] ) ) : 'pending';
+    $pending    = get_option( AAG_OPTION_PENDING, array() );
+    $logs       = get_option( AAG_OPTION_LOG, array() );
+    $all_admins = get_users( array( 'role' => 'administrator' ) );
 
-        $should_flag = false;
-        $reason = '';
+    // Count pending items for badge.
+    $pending_count = count( array_filter( $pending, static fn( $e ) => $e['status'] === 'pending' ) );
+    ?>
+    <div class="wrap">
+        <h1 style="display:flex;align-items:center;gap:10px;">
+            <span class="dashicons dashicons-shield-alt" style="font-size:30px;color:#2271b1;"></span>
+            <?php esc_html_e( 'Admin Approval Guard', 'admin-approval-guard' ); ?>
+        </h1>
+        <p style="color:#64748b;margin-bottom:20px;">
+            <?php esc_html_e( 'Mandatory administrator account approval system. No user receives admin access without your explicit approval.', 'admin-approval-guard' ); ?>
+        </p>
 
-        // Determine if this is a brand new post being created, or an update.
-        // If $postarr['ID'] is empty or 0 (or matches a new auto-draft ID), it's new.
-        // WordPress often sends ID = 0 for brand new inserts before the DB write.
-        $is_new_post = empty($postarr['ID']) || (isset($postarr['post_status']) && $postarr['post_status'] === 'auto-draft');
+        <nav class="nav-tab-wrapper">
+            <a href="?page=aag-admin-approvals&tab=pending"
+               class="nav-tab <?php echo $active_tab === 'pending' ? 'nav-tab-active' : ''; ?>">
+                <?php esc_html_e( 'Pending Requests', 'admin-approval-guard' ); ?>
+                <?php if ( $pending_count > 0 ) : ?>
+                    <span class="awaiting-mod count-<?php echo esc_attr( $pending_count ); ?>"><?php echo esc_html( $pending_count ); ?></span>
+                <?php endif; ?>
+            </a>
+            <a href="?page=aag-admin-approvals&tab=admins"
+               class="nav-tab <?php echo $active_tab === 'admins' ? 'nav-tab-active' : ''; ?>">
+                <?php esc_html_e( 'Manage Administrators', 'admin-approval-guard' ); ?>
+            </a>
+            <a href="?page=aag-admin-approvals&tab=history"
+               class="nav-tab <?php echo $active_tab === 'history' ? 'nav-tab-active' : ''; ?>">
+                <?php esc_html_e( 'Request History', 'admin-approval-guard' ); ?>
+            </a>
+            <a href="?page=aag-admin-approvals&tab=logs"
+               class="nav-tab <?php echo $active_tab === 'logs' ? 'nav-tab-active' : ''; ?>">
+                <?php esc_html_e( 'Audit Logs', 'admin-approval-guard' ); ?>
+            </a>
+            <a href="?page=aag-admin-approvals&tab=scanner"
+               class="nav-tab <?php echo $active_tab === 'scanner' ? 'nav-tab-active' : ''; ?>" style="color:#b91c1c;">
+                🔍 <?php esc_html_e( 'Malware Scanner', 'admin-approval-guard' ); ?>
+                <?php
+                $threat_count = count( get_option( 'aag_scan_threats', array() ) );
+                if ( $threat_count > 0 ) {
+                    echo '<span class="awaiting-mod" style="background:#dc2626;">' . esc_html( $threat_count ) . '</span>';
+                }
+                ?>
+            </a>
+            <a href="?page=aag-admin-approvals&tab=blocked"
+               class="nav-tab <?php echo $active_tab === 'blocked' ? 'nav-tab-active' : ''; ?>">
+                🚫 <?php esc_html_e( 'Blocked IPs', 'admin-approval-guard' ); ?>
+            </a>
+        </nav>
 
-        // 1. Bulk Post Creation Detection (Rate Limiting) - ONLY ON NEW POSTS
-        $client_ip = psc_get_client_ip();
-        if ($is_new_post && !empty($client_ip)) {
-            $transient_name = 'psc_post_rate_' . md5($client_ip);
-            $recent_posts = (int) get_transient($transient_name);
+        <div style="margin-top:20px;">
 
-            // Allow 3 posts per 3 minutes max. If exceeded, flag it.
-            if ($recent_posts >= 3) {
-                $should_flag = true;
-                $reason = 'Bulk post creation detected from IP.';
-            } else {
-                set_transient($transient_name, $recent_posts + 1, 3 * MINUTE_IN_SECONDS);
+        <?php if ( $active_tab === 'pending' ) : ?>
+            <?php
+            $pending_entries = array_filter( $pending, static fn( $e ) => $e['status'] === 'pending' );
+            ?>
+            <h2><?php esc_html_e( 'Pending Administrator Requests', 'admin-approval-guard' ); ?></h2>
+            <?php if ( empty( $pending_entries ) ) : ?>
+                <div style="background:#f0fdf4;border:1px solid #86efac;padding:20px;border-radius:8px;">
+                    <p style="color:#16a34a;margin:0;font-weight:600;">
+                        ✅ <?php esc_html_e( 'No pending administrator requests. Your site is secure.', 'admin-approval-guard' ); ?>
+                    </p>
+                </div>
+            <?php else : ?>
+                <?php foreach ( $pending_entries as $entry ) : ?>
+                    <?php
+                    $m    = $entry['meta'] ?? array();
+                    $uid  = (int) $entry['user_id'];
+                    $user = get_userdata( $uid );
+                    ?>
+                    <div style="background:#fff;border:1px solid #e2e8f0;border-left:4px solid #ef4444;border-radius:8px;padding:24px;margin-bottom:20px;box-shadow:0 2px 4px rgba(0,0,0,.04);">
+                        <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:16px;">
+                            <div>
+                                <h3 style="margin:0 0 4px;font-size:18px;color:#0f172a;">
+                                    🔴 <?php echo esc_html( $m['full_name'] ?? $m['username'] ?? "User #$uid" ); ?>
+                                </h3>
+                                <span style="font-size:12px;color:#64748b;">
+                                    <?php echo esc_html( $m['username'] ?? '' ); ?> &bull;
+                                    <?php echo esc_html( $m['email'] ?? '' ); ?> &bull;
+                                    <?php echo esc_html( gmdate( 'Y-m-d H:i', $entry['queued_at'] ) ); ?> UTC
+                                </span>
+                            </div>
+                            <div style="display:flex;gap:8px;flex-wrap:wrap;">
+                                <form method="post" style="margin:0;" onsubmit="return confirm('Approve this user for administrator access?')">
+                                    <?php wp_nonce_field( 'aag_panel_action', 'aag_panel_nonce' ); ?>
+                                    <input type="hidden" name="aag_target_user_id" value="<?php echo esc_attr( $uid ); ?>">
+                                    <input type="hidden" name="aag_panel_action" value="approve">
+                                    <button type="submit" class="button" style="background:#16a34a;color:#fff;border-color:#16a34a;">✅ <?php esc_html_e( 'Approve', 'admin-approval-guard' ); ?></button>
+                                </form>
+                                <form method="post" style="margin:0;" onsubmit="return confirm('Reject this administrator request?')">
+                                    <?php wp_nonce_field( 'aag_panel_action', 'aag_panel_nonce' ); ?>
+                                    <input type="hidden" name="aag_target_user_id" value="<?php echo esc_attr( $uid ); ?>">
+                                    <input type="hidden" name="aag_panel_action" value="reject">
+                                    <button type="submit" class="button button-secondary">❌ <?php esc_html_e( 'Reject', 'admin-approval-guard' ); ?></button>
+                                </form>
+                            </div>
+                        </div>
+
+                        <table class="widefat striped" style="margin-top:16px;font-size:13px;">
+                            <tbody>
+                            <?php
+                            $rows = array(
+                                __( 'Full Name', 'admin-approval-guard' )         => $m['full_name']     ?? 'N/A',
+                                __( 'Username', 'admin-approval-guard' )          => $m['username']      ?? 'N/A',
+                                __( 'Email Address', 'admin-approval-guard' )     => $m['email']         ?? 'N/A',
+                                __( 'Phone Number', 'admin-approval-guard' )      => $m['phone']         ?? 'N/A',
+                                __( 'Registration Date', 'admin-approval-guard' ) => $m['registered_at'] ?? 'N/A',
+                                __( 'Request Time', 'admin-approval-guard' )      => $m['request_time']  ?? 'N/A',
+                                __( 'IP Address', 'admin-approval-guard' )        => $m['ip_address']    ?? 'N/A',
+                                __( 'Country', 'admin-approval-guard' )           => $m['country']       ?? 'N/A',
+                                __( 'Region / City', 'admin-approval-guard' )     => ( $m['region'] ?? 'N/A' ) . ' / ' . ( $m['city'] ?? 'N/A' ),
+                                __( 'ISP / Network', 'admin-approval-guard' )     => $m['isp']           ?? 'N/A',
+                                __( 'Browser', 'admin-approval-guard' )           => ( $m['browser'] ?? 'N/A' ) . ' ' . ( $m['browser_ver'] ?? '' ),
+                                __( 'Operating System', 'admin-approval-guard' )  => $m['os']            ?? 'N/A',
+                                __( 'Device Type', 'admin-approval-guard' )       => $m['device_type']   ?? 'N/A',
+                                __( 'User Agent', 'admin-approval-guard' )        => $m['user_agent']    ?? 'N/A',
+                                __( 'Referrer URL', 'admin-approval-guard' )      => $m['referrer']      ?? 'N/A',
+                                __( 'Registration Source', 'admin-approval-guard' ) => $m['source']      ?? 'N/A',
+                                __( 'Alert Reason', 'admin-approval-guard' )      => $entry['reason']    ?? 'N/A',
+                            );
+                            foreach ( $rows as $label => $value ) :
+                                ?>
+                                <tr>
+                                    <th style="width:200px;font-weight:600;"><?php echo esc_html( $label ); ?></th>
+                                    <td><code style="background:#f8fafc;padding:2px 6px;border-radius:4px;font-size:12px;"><?php echo esc_html( $value ); ?></code></td>
+                                </tr>
+                            <?php endforeach; ?>
+                            </tbody>
+                        </table>
+                    </div>
+                <?php endforeach; ?>
+            <?php endif; ?>
+
+        <?php elseif ( $active_tab === 'admins' ) : ?>
+            <h2><?php esc_html_e( 'Current Administrator Accounts', 'admin-approval-guard' ); ?></h2>
+            <p style="color:#64748b;"><?php esc_html_e( 'You can revoke administrator privileges from any account below.', 'admin-approval-guard' ); ?></p>
+            <table class="wp-list-table widefat fixed striped">
+                <thead>
+                    <tr>
+                        <th><?php esc_html_e( 'Username', 'admin-approval-guard' ); ?></th>
+                        <th><?php esc_html_e( 'Display Name', 'admin-approval-guard' ); ?></th>
+                        <th><?php esc_html_e( 'Email', 'admin-approval-guard' ); ?></th>
+                        <th><?php esc_html_e( 'Registered', 'admin-approval-guard' ); ?></th>
+                        <th><?php esc_html_e( 'Action', 'admin-approval-guard' ); ?></th>
+                    </tr>
+                </thead>
+                <tbody>
+                    <?php foreach ( $all_admins as $admin ) : ?>
+                        <tr>
+                            <td><strong><?php echo esc_html( $admin->user_login ); ?></strong></td>
+                            <td><?php echo esc_html( $admin->display_name ); ?></td>
+                            <td><?php echo esc_html( $admin->user_email ); ?></td>
+                            <td><?php echo esc_html( $admin->user_registered ); ?></td>
+                            <td>
+                                <?php if ( $admin->ID !== get_current_user_id() ) : ?>
+                                    <form method="post" onsubmit="return confirm('Revoke administrator privileges from this user?')">
+                                        <?php wp_nonce_field( 'aag_panel_action', 'aag_panel_nonce' ); ?>
+                                        <input type="hidden" name="aag_target_user_id" value="<?php echo esc_attr( $admin->ID ); ?>">
+                                        <input type="hidden" name="aag_panel_action" value="revoke">
+                                        <button type="submit" class="button button-secondary button-small" style="color:#dc2626;border-color:#fca5a5;">
+                                            🚫 <?php esc_html_e( 'Revoke Admin', 'admin-approval-guard' ); ?>
+                                        </button>
+                                    </form>
+                                <?php else : ?>
+                                    <em style="color:#94a3b8;"><?php esc_html_e( '(You — cannot self-revoke)', 'admin-approval-guard' ); ?></em>
+                                <?php endif; ?>
+                            </td>
+                        </tr>
+                    <?php endforeach; ?>
+                </tbody>
+            </table>
+
+        <?php elseif ( $active_tab === 'history' ) : ?>
+            <h2><?php esc_html_e( 'Request History', 'admin-approval-guard' ); ?></h2>
+            <?php
+            $history = array_filter( $pending, static fn( $e ) => $e['status'] !== 'pending' );
+            $history = array_reverse( $history );
+            ?>
+            <?php if ( empty( $history ) ) : ?>
+                <p><?php esc_html_e( 'No actioned requests yet.', 'admin-approval-guard' ); ?></p>
+            <?php else : ?>
+                <table class="wp-list-table widefat fixed striped">
+                    <thead>
+                        <tr>
+                            <th><?php esc_html_e( 'User', 'admin-approval-guard' ); ?></th>
+                            <th><?php esc_html_e( 'Email', 'admin-approval-guard' ); ?></th>
+                            <th><?php esc_html_e( 'IP', 'admin-approval-guard' ); ?></th>
+                            <th><?php esc_html_e( 'Queued', 'admin-approval-guard' ); ?></th>
+                            <th><?php esc_html_e( 'Status', 'admin-approval-guard' ); ?></th>
+                            <th><?php esc_html_e( 'Actioned At', 'admin-approval-guard' ); ?></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ( $history as $entry ) :
+                            $m      = $entry['meta'] ?? array();
+                            $status = $entry['status'];
+                            $color  = $status === 'approved' ? '#16a34a' : '#dc2626';
+                            ?>
+                            <tr>
+                                <td><strong><?php echo esc_html( $m['username'] ?? "ID:{$entry['user_id']}" ); ?></strong></td>
+                                <td><?php echo esc_html( $m['email'] ?? 'N/A' ); ?></td>
+                                <td><code><?php echo esc_html( $m['ip_address'] ?? 'N/A' ); ?></code></td>
+                                <td><?php echo esc_html( isset( $entry['queued_at'] ) ? gmdate( 'Y-m-d H:i', $entry['queued_at'] ) . ' UTC' : 'N/A' ); ?></td>
+                                <td>
+                                    <span style="background:<?php echo esc_attr( $color ); ?>;color:#fff;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase;">
+                                        <?php echo esc_html( $status ); ?>
+                                    </span>
+                                </td>
+                                <td><?php echo esc_html( isset( $entry['actioned_at'] ) ? gmdate( 'Y-m-d H:i', $entry['actioned_at'] ) . ' UTC' : 'N/A' ); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php endif; ?>
+
+        <?php elseif ( $active_tab === 'logs' ) : ?>
+            <h2><?php esc_html_e( 'Audit Logs', 'admin-approval-guard' ); ?></h2>
+            <form method="post" style="margin-bottom:16px;" onsubmit="return confirm('Clear ALL audit logs?')">
+                <?php wp_nonce_field( 'aag_clear_logs', 'aag_clear_logs_nonce' ); ?>
+                <button type="submit" name="aag_clear_logs" class="button button-secondary">
+                    🗑️ <?php esc_html_e( 'Clear All Logs', 'admin-approval-guard' ); ?>
+                </button>
+            </form>
+            <?php if ( empty( $logs ) ) : ?>
+                <p><?php esc_html_e( 'No audit log entries yet.', 'admin-approval-guard' ); ?></p>
+            <?php else : ?>
+                <table class="wp-list-table widefat fixed striped" style="font-size:13px;">
+                    <thead>
+                        <tr>
+                            <th style="width:160px;"><?php esc_html_e( 'Time (UTC)', 'admin-approval-guard' ); ?></th>
+                            <th style="width:100px;"><?php esc_html_e( 'Severity', 'admin-approval-guard' ); ?></th>
+                            <th style="width:200px;"><?php esc_html_e( 'Event', 'admin-approval-guard' ); ?></th>
+                            <th><?php esc_html_e( 'Details', 'admin-approval-guard' ); ?></th>
+                            <th style="width:130px;"><?php esc_html_e( 'IP Address', 'admin-approval-guard' ); ?></th>
+                            <th style="width:100px;"><?php esc_html_e( 'Actor', 'admin-approval-guard' ); ?></th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        <?php foreach ( $logs as $log ) :
+                            $sev_colors = array(
+                                'info'     => '#2563eb',
+                                'warning'  => '#d97706',
+                                'critical' => '#dc2626',
+                            );
+                            $sev_color = $sev_colors[ $log['severity'] ] ?? '#64748b';
+                            ?>
+                            <tr>
+                                <td><?php echo esc_html( gmdate( 'Y-m-d H:i:s', $log['timestamp'] ) ); ?></td>
+                                <td>
+                                    <span style="background:<?php echo esc_attr( $sev_color ); ?>;color:#fff;padding:2px 6px;border-radius:3px;font-size:10px;font-weight:700;text-transform:uppercase;">
+                                        <?php echo esc_html( $log['severity'] ); ?>
+                                    </span>
+                                </td>
+                                <td><code><?php echo esc_html( $log['event_type'] ); ?></code></td>
+                                <td><?php echo esc_html( $log['details'] ); ?></td>
+                                <td><code><?php echo esc_html( $log['ip'] ); ?></code></td>
+                                <td><?php echo esc_html( $log['actor'] ); ?></td>
+                            </tr>
+                        <?php endforeach; ?>
+                    </tbody>
+                </table>
+            <?php endif; ?>
+
+        <?php elseif ( $active_tab === 'scanner' ) : ?>
+            <?php aag_render_scanner_tab(); ?>
+
+        <?php elseif ( $active_tab === 'blocked' ) : ?>
+            <?php aag_render_blocked_ips_tab(); ?>
+
+        <?php endif; ?>
+        </div>
+    </div>
+    <?php
+}
+
+// ════════════════════════════════════════════════════════════════════
+//  ███╗   ███╗ █████╗ ██╗     ██╗    ██╗ █████╗ ██████╗ ███████╗
+//  ████╗ ████║██╔══██╗██║     ██║    ██║██╔══██╗██╔══██╗██╔════╝
+//  ██╔████╔██║███████║██║     ██║ █╗ ██║███████║██████╔╝█████╗
+//  ██║╚██╔╝██║██╔══██║██║     ██║███╗██║██╔══██║██╔══██╗██╔══╝
+//  ██║ ╚═╝ ██║██║  ██║███████╗╚███╔███╔╝██║  ██║██║  ██║███████╗
+//  ╚═╝     ╚═╝╚═╝  ╚═╝╚══════╝ ╚══╝╚══╝ ╚═╝  ╚═╝╚═╝  ╚═╝╚══════╝
+//  SCANNER MODULE — Malware Detection, Repair & IP Blocking
+// ════════════════════════════════════════════════════════════════════
+
+// ── Scanner constants ──────────────────────────────────────────────
+define( 'AAG_SCAN_OPTION_THREATS',    'aag_scan_threats' );
+define( 'AAG_SCAN_OPTION_QUARANTINE', 'aag_quarantined_files' );
+define( 'AAG_SCAN_OPTION_LAST_RUN',   'aag_scan_last_run' );
+define( 'AAG_SCAN_OPTION_BASELINE',   'aag_file_baseline' );
+define( 'AAG_BLOCKED_IPS_OPTION',     'aag_blocked_ips' );
+define( 'AAG_SCAN_MAX_FILE_SIZE',     5 * 1024 * 1024 ); // 5 MB per file
+
+// ── Known malware patterns ─────────────────────────────────────────
+function aag_get_malware_patterns() {
+    return array(
+        // ── Obfuscated eval chains ──
+        'eval(base64_decode'           => 'Eval + Base64 decode (classic malware obfuscation)',
+        'eval(gzinflate'               => 'Eval + gzinflate decompression (obfuscated payload)',
+        'eval(gzuncompress'            => 'Eval + gzuncompress (obfuscated payload)',
+        'eval(str_rot13'               => 'Eval + str_rot13 rotation cipher',
+        'eval(rawurldecode'            => 'Eval + rawurldecode',
+        'eval(hex2bin'                 => 'Eval + hex2bin (hex-encoded payload)',
+        'eval(convert_uuencode'        => 'Eval + uuencode',
+        'gzinflate(base64_decode'      => 'gzinflate + base64_decode chain (layered obfuscation)',
+        'gzuncompress(base64_decode'   => 'gzuncompress + base64_decode chain',
+        // ── Remote code execution via user input ──
+        'eval($_POST'                  => 'Eval with POST input (web shell)',
+        'eval($_GET'                   => 'Eval with GET input (web shell)',
+        'eval($_REQUEST'               => 'Eval with REQUEST input (web shell)',
+        'eval($_COOKIE'                => 'Eval with COOKIE input (web shell)',
+        'eval($_SERVER'                => 'Eval with SERVER variable (web shell)',
+        'assert($_POST'                => 'Assert with POST input (web shell)',
+        'assert($_GET'                 => 'Assert with GET input (web shell)',
+        'assert($_REQUEST'             => 'Assert with REQUEST input',
+        'assert(base64_decode'         => 'Assert + base64_decode (obfuscated execution)',
+        // ── System command execution with user input ──
+        'passthru($_'                  => 'passthru() with user input (shell command injection)',
+        'system($_'                    => 'system() with user input (shell command injection)',
+        'exec($_'                      => 'exec() with user input (shell command injection)',
+        'shell_exec($_'                => 'shell_exec() with user input',
+        'popen($_'                     => 'popen() with user input',
+        '`$_'                          => 'Backtick operator with user input (shell execution)',
+        // ── Known web shell signatures ──
+        'FilesMan'                     => 'FilesMan web shell signature',
+        'c99shell'                     => 'c99shell web shell signature',
+        'r57shell'                     => 'r57shell web shell signature',
+        'wso_signature'                => 'WSO web shell signature',
+        'B374k'                        => 'B374k web shell signature',
+        'WSO Shell'                    => 'WSO Shell signature',
+        'Adminer'                      => 'Adminer database management tool (verify if intentional)',
+        'PhpSpy'                       => 'PhpSpy web shell',
+        // ── Data exfiltration & backdoor indicators ──
+        'file_put_contents($_'         => 'file_put_contents with user input (arbitrary file write)',
+        'str_rot13'                    => 'str_rot13 (encoding, common in obfuscation)',
+        '$_POST[chr('                  => 'POST with char encoding (obfuscated key access)',
+        'preg_replace_callback.*base64'=> 'preg_replace_callback + base64 (code injection vector)',
+        'create_function'              => 'create_function() deprecated — often used in malware',
+        'ReflectionFunction'           => 'ReflectionFunction used to bypass security (audit required)',
+        // ── Cryptocurrency miners ──
+        'CoinHive'                     => 'CoinHive browser mining script',
+        'coinhive.min.js'              => 'CoinHive mining JavaScript',
+        'miner.Anonymous'              => 'Crypto miner signature',
+        'cryptonight'                  => 'CryptoNight mining algorithm reference',
+        // ── Spam / SEO injections ──
+        'base64_decode.*wp_insert_post'=> 'Base64 spam post injection',
+        'wp_insert_post.*base64'       => 'Spam post injection via base64',
+    );
+}
+
+// ── SCAN ENGINE ────────────────────────────────────────────────────
+
+/**
+ * Master scan function. Runs malware pattern scan + file integrity check.
+ * Returns array of discovered threats.
+ */
+function aag_run_full_scan() {
+    // 0. Auto-purge database spam revisions and harden uploads folder.
+    if ( function_exists( 'aag_purge_spam_revisions' ) ) {
+        aag_purge_spam_revisions();
+    }
+    if ( function_exists( 'aag_harden_uploads_directory' ) ) {
+        aag_harden_uploads_directory();
+    }
+
+    $threats = array();
+
+    // 1. Malware pattern scan (plugins + themes + uploads).
+    $scan_dirs = array(
+        WP_CONTENT_DIR . '/plugins',
+        WP_CONTENT_DIR . '/themes',
+        WP_CONTENT_DIR . '/uploads',
+        ABSPATH,   // WP root (wp-config.php, index.php, etc.)
+    );
+
+    // Exclude our own quarantine folder and this plugin's folder from scanning.
+    $own_dir    = plugin_dir_path( __FILE__ );
+    $quarantine = $own_dir . 'quarantine/';
+
+    $patterns = aag_get_malware_patterns();
+
+    foreach ( $scan_dirs as $dir ) {
+        if ( ! is_dir( $dir ) ) {
+            continue;
+        }
+        $found = aag_scan_directory( $dir, $patterns, array( $own_dir, $quarantine ) );
+        $threats = array_merge( $threats, $found );
+    }
+
+    // 2. WordPress core file integrity check.
+    $core_issues = aag_check_core_integrity();
+    $threats     = array_merge( $threats, $core_issues );
+
+    // 3. Plugin file integrity check (baseline comparison).
+    $plugin_issues = aag_check_plugin_integrity();
+    $threats       = array_merge( $threats, $plugin_issues );
+
+    // 4. Active database post/page content scan.
+    if ( function_exists( 'aag_scan_database_posts' ) ) {
+        $db_issues = aag_scan_database_posts();
+        $threats   = array_merge( $threats, $db_issues );
+    }
+
+    // Store results.
+    update_option( AAG_SCAN_OPTION_THREATS, $threats, 'no' );
+    update_option( AAG_SCAN_OPTION_LAST_RUN, time(), 'no' );
+
+    return $threats;
+}
+
+/**
+ * Recursively scan a directory for malware patterns.
+ */
+function aag_scan_directory( $dir, $patterns, $exclude_dirs = array() ) {
+    $threats = array();
+
+    try {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator( $dir, RecursiveDirectoryIterator::SKIP_DOTS ),
+            RecursiveIteratorIterator::SELF_FIRST
+        );
+    } catch ( Exception $e ) {
+        return $threats;
+    }
+
+    foreach ( $iterator as $file ) {
+        if ( ! $file->isFile() ) {
+            continue;
+        }
+
+        $filepath = $file->getRealPath();
+
+        // Skip excluded directories.
+        foreach ( $exclude_dirs as $excl ) {
+            if ( strpos( $filepath, realpath( $excl ) ) === 0 ) {
+                continue 2;
             }
         }
 
-        // 2. Suspicious Link Checks
-        if (!$should_flag && !empty($data['post_content'])) {
-            $content = $data['post_content'];
-            $site_domain = parse_url(home_url(), PHP_URL_HOST);
+        // Only scan PHP, JS, and HTML files.
+        $ext = strtolower( $file->getExtension() );
+        if ( ! in_array( $ext, array( 'php', 'js', 'html', 'htm', 'phtml', 'php5', 'php7', 'phar' ), true ) ) {
+            continue;
+        }
 
-            // Extract all URLs
-            preg_match_all('/href=["\'](http[s]?:\/\/[^"\']+)["\']/i', $content, $matches);
-            $links = !empty($matches[1]) ? $matches[1] : array();
+        // Skip very large files to avoid memory exhaustion.
+        if ( $file->getSize() > AAG_SCAN_MAX_FILE_SIZE ) {
+            continue;
+        }
 
-            $external_links_count = 0;
-            $raw_blacklist = get_option('psc_blacklisted_domains', '');
-            $blacklisted_domains = array_filter(array_map('trim', explode("\n", $raw_blacklist)));
+        $content = @file_get_contents( $filepath );
+        if ( $content === false || $content === '' ) {
+            continue;
+        }
 
-            foreach ($links as $link) {
-                $link_domain = parse_url($link, PHP_URL_HOST);
-                if (!$link_domain) continue;
-
-                // If it's an external link
-                if (strcasecmp($link_domain, $site_domain) !== 0 && strcasecmp($link_domain, 'www.' . $site_domain) !== 0) {
-                    $external_links_count++;
-
-                    // Check against blacklist
-                    foreach ($blacklisted_domains as $bad_domain) {
-                        if (stripos($link_domain, $bad_domain) !== false) {
-                            $should_flag = true;
-                            $reason = 'Contains blacklisted domain: ' . $bad_domain;
-                            break 2;
-                        }
+        // Check for each pattern.
+        foreach ( $patterns as $pattern => $description ) {
+            if ( stripos( $content, $pattern ) !== false ) {
+                // Find the exact line(s).
+                $lines      = explode( "\n", $content );
+                $match_lines = array();
+                foreach ( $lines as $line_num => $line ) {
+                    if ( stripos( $line, $pattern ) !== false ) {
+                        $match_lines[] = array(
+                            'line'    => $line_num + 1,
+                            'content' => substr( trim( $line ), 0, 200 ),
+                        );
                     }
                 }
+
+                $threats[] = array(
+                    'type'        => 'malware_pattern',
+                    'file'        => $filepath,
+                    'pattern'     => $pattern,
+                    'description' => $description,
+                    'match_lines' => $match_lines,
+                    'file_size'   => $file->getSize(),
+                    'file_mtime'  => $file->getMTime(),
+                    'status'      => 'detected',
+                    'found_at'    => time(),
+                );
+                break; // One threat entry per file per pattern match.
             }
-
-            // Check max external links threshold
-            if (!$should_flag) {
-                $max_allowed = (int) get_option('psc_max_external_links', 5);
-                if ($external_links_count > $max_allowed) {
-                    $should_flag = true;
-                    $reason = "Exceeded maximum allowed external links ({$external_links_count} > {$max_allowed}).";
-                }
-            }
-        }
-
-        if ($should_flag) {
-            $data['post_status'] = 'pending';
-
-            // Send alert
-            $subject = '[Security Alert] Suspicious Post Flagged';
-            $message = "The Post Creation Monitor has intercepted a suspicious post and moved it to Pending Review.\n\n";
-            $message .= "Post Title: {$data['post_title']}\n";
-            $message .= "Reason: {$reason}\n";
-            $message .= "Author IP: {$client_ip}\n\n";
-            $message .= "Please review the post carefully before publishing.";
-            wp_mail(psc_get_alert_email(), $subject, $message);
         }
     }
 
-    return $data;
+    return $threats;
 }
 
-// 404 to Homepage Redirect
-if (get_option('psc_redirect_404_to_home', 'no') === 'yes') {
-    add_action('template_redirect', 'psc_redirect_404_to_home_action');
-}
+// ── CORE FILE INTEGRITY ────────────────────────────────────────────
 
-function psc_redirect_404_to_home_action() {
-    if (is_404()) {
-        // Capture the requested URL
-        $requested_url = (isset($_SERVER['HTTPS']) && $_SERVER['HTTPS'] === 'on' ? "https" : "http") . "://$_SERVER[HTTP_HOST]$_SERVER[REQUEST_URI]";
+/**
+ * Compare core files against WordPress.org official checksums.
+ */
+function aag_check_core_integrity() {
+    $issues  = array();
+    global $wp_version;
+    $version = preg_replace( '/-.*$/', '', $wp_version ?? get_bloginfo( 'version' ) );
+    $locale  = get_locale();
 
-        // Load logs
-        $logs = get_option('psc_404_logs', array());
-        if (!is_array($logs)) $logs = array();
+    // Fetch checksums from WordPress.org.
+    $checksums = aag_fetch_core_checksums( $version, $locale );
+    if ( empty( $checksums ) ) {
+        return $issues;
+    }
 
-        // Update log entry
-        if (isset($logs[$requested_url])) {
-            $logs[$requested_url]['hits'] = isset($logs[$requested_url]['hits']) ? $logs[$requested_url]['hits'] + 1 : 1;
-            $logs[$requested_url]['last_hit'] = current_time('mysql');
-        } else {
-            // Keep array size manageable to prevent DB bloat
-            if (count($logs) > 500) {
-                array_shift($logs);
-            }
-            $logs[$requested_url] = array(
-                'hits' => 1,
-                'last_hit' => current_time('mysql'),
-                'action' => 'home', // default action
-                'custom_url' => ''
+    foreach ( $checksums as $file => $expected_hash ) {
+        // Skip non-essential files.
+        if ( in_array( $file, array( 'wp-config-sample.php', 'readme.html', 'license.txt' ), true ) ) {
+            continue;
+        }
+
+        $local_path = ABSPATH . $file;
+
+        if ( ! file_exists( $local_path ) ) {
+            $issues[] = array(
+                'type'        => 'missing_core_file',
+                'file'        => $local_path,
+                'pattern'     => 'N/A',
+                'description' => "Core file MISSING: {$file} (expected hash: {$expected_hash})",
+                'match_lines' => array(),
+                'status'      => 'detected',
+                'found_at'    => time(),
+            );
+            continue;
+        }
+
+        $local_hash = @md5_file( $local_path );
+        if ( $local_hash !== false && $local_hash !== $expected_hash ) {
+            $issues[] = array(
+                'type'        => 'modified_core_file',
+                'file'        => $local_path,
+                'relative'    => $file,
+                'pattern'     => 'checksum_mismatch',
+                'description' => "Core file MODIFIED: {$file} (expected: {$expected_hash}, found: {$local_hash})",
+                'match_lines' => array(),
+                'file_mtime'  => filemtime( $local_path ),
+                'status'      => 'detected',
+                'found_at'    => time(),
             );
         }
+    }
 
-        update_option('psc_404_logs', $logs, false);
+    return $issues;
+}
 
-        // Execute action based on log setting
-        $action = $logs[$requested_url]['action'];
-        if ($action === 'keep') {
-            return; // Don't redirect, stay as 404
-        } elseif ($action === 'custom' && !empty($logs[$requested_url]['custom_url'])) {
-            wp_redirect($logs[$requested_url]['custom_url'], 301);
-            die();
+/**
+ * Fetch WordPress core checksums from the official API.
+ */
+function aag_fetch_core_checksums( $version, $locale ) {
+    $transient_key = 'aag_core_checksums_' . md5( $version . $locale );
+    $cached        = get_transient( $transient_key );
+    if ( $cached ) {
+        return $cached;
+    }
+
+    $response = wp_remote_get(
+        "https://api.wordpress.org/core/checksums/1.0/?version={$version}&locale={$locale}",
+        array( 'timeout' => 15 )
+    );
+    if ( ! is_wp_error( $response ) ) {
+        $data = json_decode( wp_remote_retrieve_body( $response ), true );
+        if ( ! empty( $data['checksums'] ) && isset( $data['checksums'][ $version ] ) ) {
+            $checksums = $data['checksums'][ $version ];
+            set_transient( $transient_key, $checksums, HOUR_IN_SECONDS * 6 );
+            return $checksums;
         }
+    }
 
-        // Default action: Redirect to home
-        wp_redirect(home_url(), 301);
-        die();
+    // Retry with en_US locale.
+    if ( $locale !== 'en_US' ) {
+        $response = wp_remote_get(
+            "https://api.wordpress.org/core/checksums/1.0/?version={$version}&locale=en_US",
+            array( 'timeout' => 15 )
+        );
+        if ( ! is_wp_error( $response ) ) {
+            $data = json_decode( wp_remote_retrieve_body( $response ), true );
+            if ( ! empty( $data['checksums'] ) && isset( $data['checksums'][ $version ] ) ) {
+                $checksums = $data['checksums'][ $version ];
+                set_transient( $transient_key, $checksums, HOUR_IN_SECONDS * 6 );
+                return $checksums;
+            }
+        }
+    }
+
+    return array();
+}
+
+// ── PLUGIN INTEGRITY (BASELINE) ────────────────────────────────────
+
+/**
+ * Build or compare a baseline hash of all plugin PHP files.
+ * On first run: stores the baseline. Subsequently: compares against it.
+ */
+function aag_check_plugin_integrity() {
+    $issues   = array();
+    $baseline = get_option( AAG_SCAN_OPTION_BASELINE, array() );
+
+    if ( ! is_dir( WP_PLUGIN_DIR ) ) {
+        return $issues;
+    }
+
+    $own_dir = realpath( plugin_dir_path( __FILE__ ) );
+
+    try {
+        $iterator = new RecursiveIteratorIterator(
+            new RecursiveDirectoryIterator( WP_PLUGIN_DIR, RecursiveDirectoryIterator::SKIP_DOTS )
+        );
+    } catch ( Exception $e ) {
+        return $issues;
+    }
+
+    $current_hashes = array();
+    foreach ( $iterator as $file ) {
+        if ( ! $file->isFile() ) continue;
+        if ( $file->getExtension() !== 'php' ) continue;
+        if ( $file->getSize() > AAG_SCAN_MAX_FILE_SIZE ) continue;
+
+        $fp = $file->getRealPath();
+        // Skip our own plugin files.
+        if ( $own_dir && strpos( $fp, $own_dir ) === 0 ) continue;
+
+        $hash                  = @md5_file( $fp );
+        $current_hashes[ $fp ] = $hash;
+    }
+
+    if ( empty( $baseline ) ) {
+        // First run — establish baseline.
+        update_option( AAG_SCAN_OPTION_BASELINE, $current_hashes, 'no' );
+        return $issues;
+    }
+
+    // Compare.
+    foreach ( $current_hashes as $fp => $hash ) {
+        if ( ! isset( $baseline[ $fp ] ) ) {
+            $issues[] = array(
+                'type'        => 'new_plugin_file',
+                'file'        => $fp,
+                'pattern'     => 'new_file',
+                'description' => 'New/unexpected plugin file detected (not in baseline): ' . str_replace( WP_PLUGIN_DIR, '', $fp ),
+                'match_lines' => array(),
+                'file_mtime'  => @filemtime( $fp ),
+                'status'      => 'detected',
+                'found_at'    => time(),
+            );
+        } elseif ( $baseline[ $fp ] !== $hash ) {
+            $issues[] = array(
+                'type'        => 'modified_plugin_file',
+                'file'        => $fp,
+                'pattern'     => 'hash_mismatch',
+                'description' => 'Plugin file MODIFIED since baseline: ' . str_replace( WP_PLUGIN_DIR, '', $fp ),
+                'match_lines' => array(),
+                'file_mtime'  => @filemtime( $fp ),
+                'status'      => 'detected',
+                'found_at'    => time(),
+            );
+        }
+    }
+
+    // Check for deleted files.
+    foreach ( array_keys( $baseline ) as $baseline_fp ) {
+        if ( ! isset( $current_hashes[ $baseline_fp ] ) && file_exists( dirname( $baseline_fp ) ) ) {
+            $issues[] = array(
+                'type'        => 'deleted_plugin_file',
+                'file'        => $baseline_fp,
+                'pattern'     => 'deleted_file',
+                'description' => 'Plugin file DELETED since baseline: ' . str_replace( WP_PLUGIN_DIR, '', $baseline_fp ),
+                'match_lines' => array(),
+                'status'      => 'detected',
+                'found_at'    => time(),
+            );
+        }
+    }
+
+    return $issues;
+}
+
+// ── AUTO-REPAIR SYSTEM ─────────────────────────────────────────────
+
+/**
+ * Repair a modified WordPress core file by downloading the original
+ * from WordPress.org and replacing the local copy.
+ */
+function aag_repair_core_file( $relative_path ) {
+    global $wp_version;
+    $version = preg_replace( '/-.*$/', '', $wp_version ?? get_bloginfo( 'version' ) );
+    $locale  = get_locale();
+
+    $download_url = "https://core.svn.wordpress.org/tags/{$version}/{$relative_path}";
+
+    $response = wp_remote_get( $download_url, array( 'timeout' => 30 ) );
+    if ( is_wp_error( $response ) ) {
+        // Try alternative CDN.
+        $download_url = "https://downloads.wordpress.org/release/{$version}/wordpress/{$relative_path}";
+        $response     = wp_remote_get( $download_url, array( 'timeout' => 30 ) );
+    }
+
+    if ( is_wp_error( $response ) ) {
+        return false;
+    }
+
+    $body = wp_remote_retrieve_body( $response );
+    if ( empty( $body ) ) {
+        return false;
+    }
+
+    $local_path = ABSPATH . $relative_path;
+    $dir        = dirname( $local_path );
+
+    if ( ! is_dir( $dir ) ) {
+        wp_mkdir_p( $dir );
+    }
+
+    // Backup the infected file before overwriting.
+    $backup_path = $local_path . '.aag_backup_' . time();
+    @copy( $local_path, $backup_path );
+
+    $result = @file_put_contents( $local_path, $body );
+
+    if ( $result !== false ) {
+        aag_log(
+            'core_file_repaired',
+            'info',
+            sprintf( 'Core file AUTO-REPAIRED: %s (backed up to %s)', $relative_path, basename( $backup_path ) ),
+            null
+        );
+        return true;
+    }
+
+    return false;
+}
+
+/**
+ * Quarantine a threat file — move it to an inaccessible directory.
+ */
+function aag_quarantine_malware_file( $file_path ) {
+    if ( ! file_exists( $file_path ) ) {
+        return false;
+    }
+
+    // Prevent self-bricking: never quarantine critical WordPress files or this plugin itself.
+    $real = realpath( $file_path );
+    $critical_files = array(
+        realpath( ABSPATH . 'wp-config.php' ),
+        realpath( dirname( ABSPATH ) . '/wp-config.php' ),
+        realpath( ABSPATH . 'wp-settings.php' ),
+        realpath( ABSPATH . 'wp-load.php' ),
+        realpath( __FILE__ ),
+        realpath( dirname( __FILE__ ) . '/plugin-features.php' ),
+        realpath( dirname( __FILE__ ) . '/plugin-404-logs.php' ),
+        realpath( dirname( __FILE__ ) . '/plugin-brute-force.php' ),
+    );
+    if ( $real && in_array( $real, array_filter( $critical_files ), true ) ) {
+        return false;
+    }
+
+    $quarantine_dir = plugin_dir_path( __FILE__ ) . 'quarantine/';
+
+    if ( ! is_dir( $quarantine_dir ) ) {
+        wp_mkdir_p( $quarantine_dir );
+    }
+
+    // Write .htaccess to prevent any web access to quarantine folder.
+    $htaccess = $quarantine_dir . '.htaccess';
+    if ( ! file_exists( $htaccess ) ) {
+        @file_put_contents( $htaccess, "Order Deny,Allow\nDeny from all\n" );
+    }
+    // Nginx guard file (in case server is Nginx — instructions shown in UI).
+    $nginx_guard = $quarantine_dir . 'index.php';
+    if ( ! file_exists( $nginx_guard ) ) {
+        @file_put_contents( $nginx_guard, "<?php // Silence is golden\n" );
+    }
+
+    $token            = function_exists( 'random_bytes' ) ? bin2hex( random_bytes( 8 ) ) : uniqid( 'q', true );
+    $quarantine_name  = md5( $file_path ) . '_' . $token . '.quarantine';
+    $quarantine_path  = $quarantine_dir . $quarantine_name;
+
+    if ( ! @rename( $file_path, $quarantine_path ) ) {
+        return false;
+    }
+
+    // Record in quarantine log.
+    $quarantine_log = get_option( AAG_SCAN_OPTION_QUARANTINE, array() );
+    if ( ! is_array( $quarantine_log ) ) {
+        $quarantine_log = array();
+    }
+    $quarantine_log[] = array(
+        'original_path'   => $file_path,
+        'quarantine_path' => $quarantine_path,
+        'quarantined_at'  => time(),
+        'quarantined_by'  => get_current_user_id(),
+    );
+    update_option( AAG_SCAN_OPTION_QUARANTINE, $quarantine_log, 'no' );
+
+    // Update threats list to mark as quarantined.
+    $threats = get_option( AAG_SCAN_OPTION_THREATS, array() );
+    foreach ( $threats as &$t ) {
+        if ( $t['file'] === $file_path ) {
+            $t['status']          = 'quarantined';
+            $t['quarantine_path'] = $quarantine_path;
+        }
+    }
+    unset( $t );
+    update_option( AAG_SCAN_OPTION_THREATS, $threats, 'no' );
+
+    aag_log( 'file_quarantined', 'warning', 'File quarantined: ' . $file_path, null );
+
+    return true;
+}
+
+/**
+ * Restore a quarantined file back to its original location.
+ */
+function aag_restore_quarantined_file( $quarantine_path ) {
+    $quarantine_log = get_option( AAG_SCAN_OPTION_QUARANTINE, array() );
+
+    foreach ( $quarantine_log as $key => $entry ) {
+        if ( $entry['quarantine_path'] !== $quarantine_path ) {
+            continue;
+        }
+        if ( ! file_exists( $quarantine_path ) ) {
+            return false;
+        }
+        $dest_dir = dirname( $entry['original_path'] );
+        if ( ! is_dir( $dest_dir ) ) {
+            wp_mkdir_p( $dest_dir );
+        }
+        if ( @rename( $quarantine_path, $entry['original_path'] ) ) {
+            unset( $quarantine_log[ $key ] );
+            update_option( AAG_SCAN_OPTION_QUARANTINE, array_values( $quarantine_log ), 'no' );
+            aag_log( 'file_restored', 'info', 'File restored from quarantine: ' . $entry['original_path'], null );
+            return true;
+        }
+    }
+
+    return false;
+}
+
+/**
+ * Permanently delete a quarantined file.
+ */
+function aag_delete_quarantined_file( $quarantine_path ) {
+    $quarantine_log = get_option( AAG_SCAN_OPTION_QUARANTINE, array() );
+
+    foreach ( $quarantine_log as $key => $entry ) {
+        if ( $entry['quarantine_path'] !== $quarantine_path ) {
+            continue;
+        }
+        @unlink( $quarantine_path );
+        unset( $quarantine_log[ $key ] );
+        update_option( AAG_SCAN_OPTION_QUARANTINE, array_values( $quarantine_log ), 'no' );
+        aag_log( 'file_deleted', 'warning', 'Quarantined file permanently deleted: ' . $entry['original_path'], null );
+        return true;
+    }
+
+    return false;
+}
+
+// ── IP BLOCKING SYSTEM ─────────────────────────────────────────────
+
+/**
+ * Block an IP address and optionally write to .htaccess.
+ */
+function aag_block_ip( $ip, $reason = '' ) {
+    if ( ! filter_var( $ip, FILTER_VALIDATE_IP ) ) {
+        return;
+    }
+
+    $blocked = get_option( AAG_BLOCKED_IPS_OPTION, array() );
+    if ( ! is_array( $blocked ) ) {
+        $blocked = array();
+    }
+
+    // Avoid duplicates.
+    foreach ( $blocked as $entry ) {
+        if ( $entry['ip'] === $ip ) {
+            return;
+        }
+    }
+
+    $blocked[] = array(
+        'ip'         => $ip,
+        'reason'     => sanitize_text_field( $reason ),
+        'blocked_at' => time(),
+        'blocked_by' => get_current_user_id() ?: 'system',
+    );
+    update_option( AAG_BLOCKED_IPS_OPTION, $blocked, 'no' );
+
+    // Write to .htaccess (Apache).
+    aag_write_htaccess_block( $ip );
+
+    // Write to Nginx config file.
+    aag_write_nginx_block_all( $blocked );
+
+    aag_log(
+        'ip_blocked',
+        'critical',
+        sprintf( 'IP address BLOCKED: %s — Reason: %s', $ip, $reason ),
+        null
+    );
+
+    // Alert email.
+    wp_mail(
+        AAG_NOTIFY_EMAIL,
+        sprintf( '[Security Alert] IP Blocked — %s', get_bloginfo( 'name' ) ),
+        sprintf(
+            "Admin Approval Guard has blocked an IP address.\n\nIP Address : %s\nReason     : %s\nTime (UTC) : %s\n\nYou can manage blocked IPs at:\n%s",
+            $ip,
+            $reason,
+            gmdate( 'Y-m-d H:i:s' ),
+            admin_url( 'admin.php?page=aag-admin-approvals&tab=blocked' )
+        )
+    );
+}
+
+/**
+ * Unblock an IP address.
+ */
+function aag_unblock_ip( $ip ) {
+    $blocked = get_option( AAG_BLOCKED_IPS_OPTION, array() );
+    if ( ! is_array( $blocked ) ) {
+        return;
+    }
+    $blocked = array_values( array_filter( $blocked, static fn( $e ) => $e['ip'] !== $ip ) );
+    update_option( AAG_BLOCKED_IPS_OPTION, $blocked, 'no' );
+    aag_write_htaccess_block_all( $blocked );
+    aag_write_nginx_block_all( $blocked );
+    aag_log( 'ip_unblocked', 'info', 'IP address unblocked: ' . $ip, null );
+}
+
+/**
+ * Check if the current visitor's IP is blocked, and serve a 403 if so.
+ */
+add_action( 'init', 'aag_enforce_ip_block', 1 );
+function aag_enforce_ip_block() {
+    if ( is_admin() && is_user_logged_in() && current_user_can( 'manage_options' ) ) {
+        return; // Never lock out the actual admin.
+    }
+
+    $ip      = aag_get_client_ip();
+    $blocked = get_option( AAG_BLOCKED_IPS_OPTION, array() );
+
+    if ( ! is_array( $blocked ) || empty( $ip ) ) {
+        return;
+    }
+
+    foreach ( $blocked as $entry ) {
+        if ( isset( $entry['ip'] ) && $entry['ip'] === $ip ) {
+            aag_log( 'blocked_ip_access_attempt', 'critical', 'Blocked IP tried to access site: ' . $ip, null );
+            http_response_code( 403 );
+            exit( '<!DOCTYPE html><html><head><title>403 Forbidden</title></head><body style="font-family:sans-serif;text-align:center;padding:60px;background:#0f172a;color:#f8fafc;"><h1 style="color:#ef4444;">403 — Access Denied</h1><p>Your IP address (<code>' . esc_html( $ip ) . '</code>) has been blocked by the website security system.</p><p>If you believe this is an error, contact the site administrator.</p></body></html>' );
+        }
     }
 }
+
+/**
+ * Write .htaccess deny rules for a single IP (Apache only).
+ */
+function aag_write_htaccess_block( $ip ) {
+    $htaccess = ABSPATH . '.htaccess';
+    if ( ! file_exists( $htaccess ) || ! is_writable( $htaccess ) ) {
+        return;
+    }
+    $content  = @file_get_contents( $htaccess );
+    $marker   = '# BEGIN Admin-Approval-Guard-Blocked-IPs';
+    $end      = '# END Admin-Approval-Guard-Blocked-IPs';
+
+    $new_rule = "Deny from {$ip}";
+
+    if ( strpos( $content, $marker ) !== false ) {
+        // Inject into existing block.
+        $content = preg_replace(
+            '/(' . preg_quote( $end, '/' ) . ')/',
+            "{$new_rule}\n$1",
+            $content
+        );
+    } else {
+        $content .= "\n{$marker}\n<RequireAll>\nRequire all granted\n{$new_rule}\n</RequireAll>\n{$end}\n";
+    }
+
+    @file_put_contents( $htaccess, $content );
+}
+
+/**
+ * Rewrite the entire .htaccess blocked IP block from the stored list.
+ */
+function aag_write_htaccess_block_all( $blocked_list ) {
+    $htaccess = ABSPATH . '.htaccess';
+    if ( ! file_exists( $htaccess ) || ! is_writable( $htaccess ) ) {
+        return;
+    }
+
+    $content = @file_get_contents( $htaccess );
+    $marker  = '# BEGIN Admin-Approval-Guard-Blocked-IPs';
+    $end     = '# END Admin-Approval-Guard-Blocked-IPs';
+
+    // Remove existing block.
+    $content = preg_replace( '/' . preg_quote( $marker, '/' ) . '.*?' . preg_quote( $end, '/' ) . '/s', '', $content );
+
+    if ( ! empty( $blocked_list ) ) {
+        $rules = array_map( static fn( $e ) => 'Deny from ' . $e['ip'], $blocked_list );
+        $block = "\n{$marker}\n<RequireAll>\nRequire all granted\n" . implode( "\n", $rules ) . "\n</RequireAll>\n{$end}\n";
+        $content .= $block;
+    }
+
+    @file_put_contents( $htaccess, $content );
+}
+
+/**
+ * Write Nginx configuration block file in ABSPATH.
+ */
+function aag_write_nginx_block_all( $blocked_list ) {
+    $conf_path = ABSPATH . 'nginx-blocked-ips.conf';
+
+    $content  = "# BEGIN Admin-Approval-Guard-Blocked-IPs\n";
+    if ( ! empty( $blocked_list ) ) {
+        foreach ( $blocked_list as $entry ) {
+            if ( isset( $entry['ip'] ) && filter_var( $entry['ip'], FILTER_VALIDATE_IP ) ) {
+                $content .= "deny " . $entry['ip'] . ";\n";
+            }
+        }
+    }
+    $content .= "# END Admin-Approval-Guard-Blocked-IPs\n";
+
+    if ( ! is_dir( dirname( $conf_path ) ) ) {
+        if ( function_exists( 'wp_mkdir_p' ) ) {
+            wp_mkdir_p( dirname( $conf_path ) );
+        } else {
+            @mkdir( dirname( $conf_path ), 0777, true );
+        }
+    }
+    @file_put_contents( $conf_path, $content );
+}
+
+// ── SCHEDULED DAILY SCAN ───────────────────────────────────────────
+
+add_action( 'aag_daily_malware_scan', 'aag_run_scheduled_scan' );
+function aag_run_scheduled_scan() {
+    $threats = aag_run_full_scan();
+
+    if ( empty( $threats ) ) {
+        aag_log( 'scheduled_scan_clean', 'info', 'Daily malware scan completed. No threats found.', null );
+        return;
+    }
+
+    // Build a threat summary email.
+    $critical = array_filter( $threats, static fn( $t ) => in_array( $t['type'], array( 'malware_pattern', 'modified_core_file' ), true ) );
+
+    $lines   = array();
+    $lines[] = '════════════════════════════════════════════════════';
+    $lines[] = '  🚨 MALWARE SCAN ALERT — ' . get_bloginfo( 'name' );
+    $lines[] = '════════════════════════════════════════════════════';
+    $lines[] = '';
+    $lines[] = 'Scan Time   : ' . gmdate( 'Y-m-d H:i:s' ) . ' UTC';
+    $lines[] = 'Total Threats: ' . count( $threats );
+    $lines[] = 'Critical    : ' . count( $critical );
+    $lines[] = '';
+    $lines[] = '────── THREAT SUMMARY ──────';
+
+    foreach ( $threats as $i => $t ) {
+        $lines[] = sprintf( '%d. [%s] %s', $i + 1, strtoupper( $t['type'] ), $t['description'] );
+        $lines[] = '   File: ' . $t['file'];
+        $lines[] = '';
+    }
+
+    $lines[] = '────────────────────────────────────────────────────';
+    $lines[] = 'Manage threats in your admin panel:';
+    $lines[] = admin_url( 'admin.php?page=aag-admin-approvals&tab=scanner' );
+
+    wp_mail(
+        AAG_NOTIFY_EMAIL,
+        sprintf( '[🚨 MALWARE ALERT] %d threat(s) found — %s', count( $threats ), get_bloginfo( 'name' ) ),
+        implode( "\n", $lines ),
+        array( 'Content-Type: text/plain; charset=UTF-8', 'X-Priority: 1' )
+    );
+
+    aag_log(
+        'scheduled_scan_threats',
+        'critical',
+        sprintf( 'Daily malware scan found %d threat(s). Alert email sent to %s.', count( $threats ), AAG_NOTIFY_EMAIL ),
+        null
+    );
+
+    // Auto-repair modified core files.
+    foreach ( $threats as $t ) {
+        if ( $t['type'] === 'modified_core_file' && isset( $t['relative'] ) ) {
+            aag_repair_core_file( $t['relative'] );
+        }
+    }
+}
+
+// Register cron event on activation (adds to existing activation hook).
+add_action( 'wp_loaded', 'aag_ensure_scanner_cron' );
+function aag_ensure_scanner_cron() {
+    if ( ! wp_next_scheduled( 'aag_daily_malware_scan' ) ) {
+        wp_schedule_event( time(), 'daily', 'aag_daily_malware_scan' );
+    }
+}
+
+// ── AJAX: MANUAL SCAN TRIGGER ──────────────────────────────────────
+
+add_action( 'wp_ajax_aag_run_scan', 'aag_ajax_run_scan' );
+function aag_ajax_run_scan() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( 'Unauthorized.' );
+    }
+    check_ajax_referer( 'aag_run_scan', 'nonce' );
+
+    $threats = aag_run_full_scan();
+
+    wp_send_json_success( array(
+        'count'   => count( $threats ),
+        'threats' => array_slice( $threats, 0, 50 ), // Return first 50 for display.
+    ) );
+}
+
+// ── AJAX: QUARANTINE A FILE ────────────────────────────────────────
+
+add_action( 'wp_ajax_aag_quarantine_file', 'aag_ajax_quarantine_file' );
+function aag_ajax_quarantine_file() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( 'Unauthorized.' );
+    }
+    check_ajax_referer( 'aag_file_action', 'nonce' );
+
+    $file = isset( $_POST['file'] ) ? sanitize_text_field( wp_unslash( $_POST['file'] ) ) : '';
+    if ( empty( $file ) || ! file_exists( $file ) ) {
+        wp_send_json_error( 'File not found.' );
+    }
+
+    $result = aag_quarantine_malware_file( $file );
+    $result ? wp_send_json_success( 'File quarantined.' ) : wp_send_json_error( 'Could not quarantine file.' );
+}
+
+// ── AJAX: REPAIR CORE FILE ─────────────────────────────────────────
+
+add_action( 'wp_ajax_aag_repair_file', 'aag_ajax_repair_file' );
+function aag_ajax_repair_file() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( 'Unauthorized.' );
+    }
+    check_ajax_referer( 'aag_file_action', 'nonce' );
+
+    $relative = isset( $_POST['relative'] ) ? sanitize_text_field( wp_unslash( $_POST['relative'] ) ) : '';
+    if ( empty( $relative ) ) {
+        wp_send_json_error( 'No relative path provided.' );
+    }
+
+    $result = aag_repair_core_file( $relative );
+    $result ? wp_send_json_success( 'Core file repaired from WordPress.org.' ) : wp_send_json_error( 'Could not download/repair the file. Check server permissions.' );
+}
+
+// ── AJAX: DELETE THREAT (clear from list) ─────────────────────────
+
+add_action( 'wp_ajax_aag_dismiss_threat', 'aag_ajax_dismiss_threat' );
+function aag_ajax_dismiss_threat() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        wp_send_json_error( 'Unauthorized.' );
+    }
+    check_ajax_referer( 'aag_file_action', 'nonce' );
+
+    $file    = isset( $_POST['file'] ) ? sanitize_text_field( wp_unslash( $_POST['file'] ) ) : '';
+    $threats = get_option( AAG_SCAN_OPTION_THREATS, array() );
+    $threats = array_values( array_filter( $threats, static fn( $t ) => $t['file'] !== $file ) );
+    update_option( AAG_SCAN_OPTION_THREATS, $threats, 'no' );
+
+    aag_log( 'threat_dismissed', 'info', 'Threat dismissed (marked safe): ' . $file, null );
+    wp_send_json_success( 'Threat dismissed.' );
+}
+
+// ── MONITOR: Block IPs that try to upload PHP in media folder ─────
+
+add_filter( 'wp_handle_upload_prefilter', 'aag_block_php_uploads' );
+function aag_block_php_uploads( $file ) {
+    $disallowed_exts = array( 'php', 'php3', 'php4', 'php5', 'php7', 'phtml', 'phar', 'shtml', 'cgi', 'pl', 'py', 'rb', 'sh', 'bash' );
+    $ext             = strtolower( pathinfo( $file['name'], PATHINFO_EXTENSION ) );
+
+    if ( in_array( $ext, $disallowed_exts, true ) ) {
+        $ip = aag_get_client_ip();
+        aag_block_ip( $ip, 'Attempted to upload executable file: ' . sanitize_file_name( $file['name'] ) );
+        aag_log(
+            'malicious_upload_blocked',
+            'critical',
+            sprintf( 'PHP/executable file upload BLOCKED: %s from IP %s', $file['name'], $ip ),
+            null
+        );
+        $file['error'] = 'This file type is not allowed for security reasons. Executable files cannot be uploaded.';
+    }
+
+    return $file;
+}
+
+// ── MONITOR: Watch for suspicious POST patterns (web shell probes) ─
+
+add_action( 'init', 'aag_detect_webshell_probe', 5 );
+function aag_detect_webshell_probe() {
+    if ( wp_doing_cron() || ( defined( 'WP_CLI' ) && WP_CLI ) ) {
+        return;
+    }
+
+    $suspicious_params = array( 'cmd', 'exec', 'system', 'shell', 'backdoor', 'passthru', 'eval' );
+    $request_keys      = array_keys( array_merge( $_GET, $_POST ) );
+    $request_keys      = array_map( 'strtolower', $request_keys );
+
+    foreach ( $suspicious_params as $param ) {
+        if ( in_array( $param, $request_keys, true ) ) {
+            $ip = aag_get_client_ip();
+            aag_log(
+                'webshell_probe_detected',
+                'critical',
+                sprintf( 'Web shell probe detected (param: %s) from IP %s. IP blocked.', $param, $ip ),
+                null
+            );
+            aag_block_ip( $ip, 'Web shell parameter probe detected: ' . $param );
+            http_response_code( 403 );
+            exit( '403 Forbidden' );
+        }
+    }
+}
+
+// ── SCANNER ADMIN TAB RENDERER ─────────────────────────────────────
+
+function aag_render_scanner_tab() {
+    // Handle form actions.
+    if ( isset( $_POST['aag_scanner_action'], $_POST['aag_scanner_nonce'] ) ) {
+        if ( ! wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['aag_scanner_nonce'] ) ), 'aag_scanner_action' ) ) {
+            wp_die( esc_html__( 'Security check failed.', 'admin-approval-guard' ) );
+        }
+
+        $action = sanitize_key( wp_unslash( $_POST['aag_scanner_action'] ) );
+
+        if ( $action === 'run_scan' ) {
+            $threats = aag_run_full_scan();
+            $cnt     = count( $threats );
+            echo '<div class="notice notice-' . ( $cnt > 0 ? 'error' : 'success' ) . '"><p><strong>' .
+                 esc_html( $cnt > 0 ? "⚠️ Scan complete: {$cnt} threat(s) found." : '✅ Scan complete. No threats detected!' ) .
+                 '</strong></p></div>';
+        } elseif ( $action === 'quarantine_file' && isset( $_POST['aag_target_file'] ) ) {
+            $file = sanitize_text_field( wp_unslash( $_POST['aag_target_file'] ) );
+            $ok   = aag_quarantine_malware_file( $file );
+            echo '<div class="notice notice-' . ( $ok ? 'success' : 'error' ) . '"><p>' .
+                 esc_html( $ok ? 'File quarantined successfully.' : 'Could not quarantine file. Check permissions.' ) .
+                 '</p></div>';
+        } elseif ( $action === 'repair_core_file' && isset( $_POST['aag_relative_path'] ) ) {
+            $rel = sanitize_text_field( wp_unslash( $_POST['aag_relative_path'] ) );
+            $ok  = aag_repair_core_file( $rel );
+            echo '<div class="notice notice-' . ( $ok ? 'success' : 'error' ) . '"><p>' .
+                 esc_html( $ok ? '✅ Core file repaired from WordPress.org.' : '❌ Repair failed. Check server internet access / permissions.' ) .
+                 '</p></div>';
+        } elseif ( $action === 'dismiss_threat' && isset( $_POST['aag_target_file'] ) ) {
+            $file    = sanitize_text_field( wp_unslash( $_POST['aag_target_file'] ) );
+            $threats = get_option( AAG_SCAN_OPTION_THREATS, array() );
+            $threats = array_values( array_filter( $threats, static fn( $t ) => $t['file'] !== $file ) );
+            update_option( AAG_SCAN_OPTION_THREATS, $threats, 'no' );
+            aag_log( 'threat_dismissed', 'info', 'Threat marked safe: ' . $file, null );
+            echo '<div class="notice notice-success"><p>✅ Threat dismissed.</p></div>';
+        } elseif ( $action === 'rebuild_baseline' ) {
+            delete_option( AAG_SCAN_OPTION_BASELINE );
+            echo '<div class="notice notice-success"><p>✅ Plugin file baseline cleared. It will be rebuilt on the next scan.</p></div>';
+        }
+    }
+
+    // Handle quarantine restore / delete.
+    if ( isset( $_POST['aag_quarantine_action'], $_POST['aag_scanner_nonce'] ) ) {
+        if ( wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['aag_scanner_nonce'] ) ), 'aag_scanner_action' ) ) {
+            $qaction = sanitize_key( wp_unslash( $_POST['aag_quarantine_action'] ) );
+            $qpath   = isset( $_POST['aag_quarantine_path'] ) ? sanitize_text_field( wp_unslash( $_POST['aag_quarantine_path'] ) ) : '';
+            if ( $qaction === 'restore' ) {
+                $ok = aag_restore_quarantined_file( $qpath );
+                echo '<div class="notice notice-' . ( $ok ? 'success' : 'error' ) . '"><p>' . esc_html( $ok ? 'File restored.' : 'Restore failed.' ) . '</p></div>';
+            } elseif ( $qaction === 'delete' ) {
+                $ok = aag_delete_quarantined_file( $qpath );
+                echo '<div class="notice notice-' . ( $ok ? 'success' : 'error' ) . '"><p>' . esc_html( $ok ? 'File permanently deleted.' : 'Delete failed.' ) . '</p></div>';
+            }
+        }
+    }
+
+    $threats       = get_option( AAG_SCAN_OPTION_THREATS, array() );
+    $quarantined   = get_option( AAG_SCAN_OPTION_QUARANTINE, array() );
+    $last_run      = get_option( AAG_SCAN_OPTION_LAST_RUN, 0 );
+    $next_scan     = wp_next_scheduled( 'aag_daily_malware_scan' );
+
+    $type_colors = array(
+        'malware_pattern'      => '#dc2626',
+        'modified_core_file'   => '#b45309',
+        'missing_core_file'    => '#7c3aed',
+        'modified_plugin_file' => '#0369a1',
+        'new_plugin_file'      => '#0369a1',
+        'deleted_plugin_file'  => '#6b7280',
+    );
+    ?>
+    <h2>🔍 Malware Scanner &amp; File Integrity</h2>
+
+    <!-- Status Bar -->
+    <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:16px;margin-bottom:24px;">
+        <?php
+        $stats = array(
+            array( 'label' => 'Threats Found',   'val' => count( $threats ),                                    'color' => count($threats) > 0 ? '#dc2626' : '#16a34a' ),
+            array( 'label' => 'Quarantined',      'val' => count( $quarantined ),                                'color' => '#d97706' ),
+            array( 'label' => 'Last Scan',        'val' => $last_run ? human_time_diff( $last_run ) . ' ago' : 'Never', 'color' => '#2563eb' ),
+            array( 'label' => 'Next Auto-Scan',   'val' => $next_scan ? human_time_diff( $next_scan ) : 'Not scheduled', 'color' => '#7c3aed' ),
+        );
+        foreach ( $stats as $s ) : ?>
+            <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:16px;text-align:center;box-shadow:0 1px 3px rgba(0,0,0,.05);">
+                <div style="font-size:28px;font-weight:800;color:<?php echo esc_attr( $s['color'] ); ?>;"><?php echo esc_html( $s['val'] ); ?></div>
+                <div style="font-size:12px;color:#64748b;margin-top:4px;"><?php echo esc_html( $s['label'] ); ?></div>
+            </div>
+        <?php endforeach; ?>
+    </div>
+
+    <!-- Run Scan Form -->
+    <form method="post" style="margin-bottom:20px;">
+        <?php wp_nonce_field( 'aag_scanner_action', 'aag_scanner_nonce' ); ?>
+        <input type="hidden" name="aag_scanner_action" value="run_scan">
+        <button type="submit" class="button button-primary" style="background:#dc2626;border-color:#b91c1c;font-size:14px;height:36px;padding:0 20px;">
+            🔍 Run Full Scan Now
+        </button>
+        <button type="submit" class="button button-secondary" style="margin-left:8px;"
+            onclick="this.form.aag_scanner_action.value='rebuild_baseline'; return confirm('Rebuild plugin baseline? This will reset change detection.')">
+            🔄 Rebuild Plugin Baseline
+        </button>
+        <span style="margin-left:12px;color:#64748b;font-size:12px;">⏱ Scans run automatically every 24 hours. The scanner checks plugins, themes, uploads, and core files.</span>
+    </form>
+
+    <!-- Threats Table -->
+    <?php if ( empty( $threats ) ) : ?>
+        <div style="background:#f0fdf4;border:1px solid #86efac;padding:24px;border-radius:8px;text-align:center;">
+            <p style="color:#16a34a;margin:0;font-size:16px;font-weight:700;">✅ No threats detected. Your site is clean!</p>
+            <p style="color:#64748b;margin:8px 0 0;font-size:13px;">Run a scan above or wait for the daily automatic scan.</p>
+        </div>
+    <?php else : ?>
+        <h3 style="color:#dc2626;">⚠️ <?php echo esc_html( count( $threats ) ); ?> Threat(s) Detected</h3>
+        <?php foreach ( $threats as $threat ) :
+            $color  = $type_colors[ $threat['type'] ] ?? '#6b7280';
+            $status = $threat['status'];
+            ?>
+            <div style="background:#fff;border:1px solid #e2e8f0;border-left:4px solid <?php echo esc_attr( $color ); ?>;border-radius:8px;padding:20px;margin-bottom:16px;box-shadow:0 1px 3px rgba(0,0,0,.04);">
+                <div style="display:flex;justify-content:space-between;align-items:flex-start;flex-wrap:wrap;gap:12px;">
+                    <div>
+                        <span style="background:<?php echo esc_attr( $color ); ?>;color:#fff;padding:3px 8px;border-radius:4px;font-size:11px;font-weight:700;text-transform:uppercase;">
+                            <?php echo esc_html( str_replace( '_', ' ', $threat['type'] ) ); ?>
+                        </span>
+                        &nbsp;
+                        <span style="font-size:12px;color:#64748b;"><?php echo esc_html( $status ); ?></span>
+                        <p style="margin:6px 0 2px;font-size:13px;font-weight:600;color:#0f172a;"><?php echo esc_html( $threat['description'] ); ?></p>
+                        <code style="font-size:11px;color:#475569;word-break:break-all;"><?php echo esc_html( $threat['file'] ); ?></code>
+                        <?php if ( ! empty( $threat['file_mtime'] ) ) : ?>
+                            <p style="margin:4px 0 0;font-size:11px;color:#94a3b8;">Last modified: <?php echo esc_html( gmdate( 'Y-m-d H:i:s', $threat['file_mtime'] ) ); ?> UTC</p>
+                        <?php endif; ?>
+                        <?php if ( ! empty( $threat['match_lines'] ) ) : ?>
+                            <div style="margin-top:8px;background:#fef2f2;border:1px solid #fecaca;border-radius:4px;padding:8px;font-size:11px;">
+                                <strong>Matched Lines:</strong>
+                                <?php foreach ( array_slice( $threat['match_lines'], 0, 3 ) as $ml ) : ?>
+                                    <div><span style="color:#94a3b8;">L<?php echo esc_html( $ml['line'] ); ?>:</span> <code><?php echo esc_html( $ml['content'] ); ?></code></div>
+                                <?php endforeach; ?>
+                            </div>
+                        <?php endif; ?>
+                    </div>
+                    <div style="display:flex;flex-direction:column;gap:6px;min-width:160px;">
+                        <?php if ( $status === 'detected' ) : ?>
+                            <?php if ( $threat['type'] === 'modified_core_file' && isset( $threat['relative'] ) ) : ?>
+                                <form method="post">
+                                    <?php wp_nonce_field( 'aag_scanner_action', 'aag_scanner_nonce' ); ?>
+                                    <input type="hidden" name="aag_scanner_action" value="repair_core_file">
+                                    <input type="hidden" name="aag_relative_path" value="<?php echo esc_attr( $threat['relative'] ); ?>">
+                                    <button type="submit" class="button" style="background:#16a34a;color:#fff;border-color:#16a34a;width:100%;"
+                                        onclick="return confirm('Download and restore this core file from WordPress.org?')">
+                                        🔧 Auto-Repair
+                                    </button>
+                                </form>
+                            <?php endif; ?>
+                            <form method="post">
+                                <?php wp_nonce_field( 'aag_scanner_action', 'aag_scanner_nonce' ); ?>
+                                <input type="hidden" name="aag_scanner_action" value="quarantine_file">
+                                <input type="hidden" name="aag_target_file" value="<?php echo esc_attr( $threat['file'] ); ?>">
+                                <button type="submit" class="button button-secondary" style="width:100%;color:#d97706;border-color:#fbbf24;"
+                                    onclick="return confirm('Move this file to quarantine? It will be inaccessible until restored.')">
+                                    🔒 Quarantine
+                                </button>
+                            </form>
+                            <form method="post">
+                                <?php wp_nonce_field( 'aag_scanner_action', 'aag_scanner_nonce' ); ?>
+                                <input type="hidden" name="aag_scanner_action" value="dismiss_threat">
+                                <input type="hidden" name="aag_target_file" value="<?php echo esc_attr( $threat['file'] ); ?>">
+                                <button type="submit" class="button button-secondary" style="width:100%;font-size:11px;">
+                                    ✓ Mark Safe
+                                </button>
+                            </form>
+                        <?php elseif ( $status === 'quarantined' ) : ?>
+                            <span style="color:#d97706;font-size:12px;font-weight:600;">🔒 In Quarantine</span>
+                        <?php endif; ?>
+                    </div>
+                </div>
+            </div>
+        <?php endforeach; ?>
+    <?php endif; ?>
+
+    <!-- Quarantined Files Table -->
+    <?php if ( ! empty( $quarantined ) ) : ?>
+        <h3 style="margin-top:32px;">🔒 Quarantined Files (<?php echo esc_html( count( $quarantined ) ); ?>)</h3>
+        <table class="wp-list-table widefat fixed striped" style="font-size:13px;">
+            <thead>
+                <tr>
+                    <th>Original Path</th>
+                    <th style="width:160px;">Quarantined At</th>
+                    <th style="width:180px;">Actions</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ( $quarantined as $q ) : ?>
+                    <tr>
+                        <td><code style="font-size:11px;word-break:break-all;"><?php echo esc_html( $q['original_path'] ); ?></code></td>
+                        <td><?php echo esc_html( gmdate( 'Y-m-d H:i', $q['quarantined_at'] ) . ' UTC' ); ?></td>
+                        <td>
+                            <form method="post" style="display:inline;">
+                                <?php wp_nonce_field( 'aag_scanner_action', 'aag_scanner_nonce' ); ?>
+                                <input type="hidden" name="aag_quarantine_action" value="restore">
+                                <input type="hidden" name="aag_quarantine_path" value="<?php echo esc_attr( $q['quarantine_path'] ); ?>">
+                                <button type="submit" class="button button-secondary button-small"
+                                    onclick="return confirm('Restore this file? It will be accessible again.')">↩ Restore</button>
+                            </form>
+                            <form method="post" style="display:inline;margin-left:4px;">
+                                <?php wp_nonce_field( 'aag_scanner_action', 'aag_scanner_nonce' ); ?>
+                                <input type="hidden" name="aag_quarantine_action" value="delete">
+                                <input type="hidden" name="aag_quarantine_path" value="<?php echo esc_attr( $q['quarantine_path'] ); ?>">
+                                <button type="submit" class="button button-secondary button-small" style="color:#dc2626;"
+                                    onclick="return confirm('PERMANENTLY DELETE this file? This cannot be undone.')">🗑 Delete</button>
+                            </form>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    <?php endif; ?>
+
+    <!-- Nginx Note -->
+    <div style="background:#fffbeb;border:1px solid #fde68a;border-radius:8px;padding:16px;margin-top:24px;">
+        <h3 style="margin: 0 0 10px; font-size: 15px;">📋 Nginx Server Hardening Instructions</h3>
+        <p style="margin: 0 0 8px; color: #4b5563;">
+            Because Nginx ignores <code>.htaccess</code> files, you must add these rules directly to your Nginx configuration:
+        </p>
+        <p><strong>1. Enable IP Lockouts at Web Server Layer:</strong></p>
+        <pre style="background:#fefefe;border:1px solid #e2e8f0;padding:8px;margin:4px 0 12px;font-size:12px;border-radius:4px;overflow-x:auto;">include <?php echo esc_html( ABSPATH . 'nginx-blocked-ips.conf' ); ?>;</pre>
+        
+        <p><strong>2. Block PHP Execution inside Uploads Directory (Returns 403 Forbidden):</strong></p>
+        <pre style="background:#fefefe;border:1px solid #e2e8f0;padding:8px;margin:4px 0 0;font-size:12px;border-radius:4px;overflow-x:auto;">include <?php echo esc_html( ABSPATH . 'nginx-uploads-hardening.conf' ); ?>;</pre>
+    </div>
+    <?php
+}
+
+// ── BLOCKED IPS ADMIN TAB ──────────────────────────────────────────
+
+function aag_render_blocked_ips_tab() {
+    // Handle unblock action.
+    if ( isset( $_POST['aag_unblock_ip'], $_POST['aag_block_nonce'] ) ) {
+        if ( wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['aag_block_nonce'] ) ), 'aag_block_action' ) ) {
+            $ip = sanitize_text_field( wp_unslash( $_POST['aag_unblock_ip'] ) );
+            aag_unblock_ip( $ip );
+            echo '<div class="notice notice-success"><p>✅ IP ' . esc_html( $ip ) . ' unblocked.</p></div>';
+        }
+    }
+
+    // Handle manual block.
+    if ( isset( $_POST['aag_manual_block_ip'], $_POST['aag_block_nonce'] ) ) {
+        if ( wp_verify_nonce( sanitize_text_field( wp_unslash( $_POST['aag_block_nonce'] ) ), 'aag_block_action' ) ) {
+            $ip     = sanitize_text_field( wp_unslash( $_POST['aag_manual_block_ip'] ) );
+            $reason = sanitize_text_field( wp_unslash( $_POST['aag_block_reason'] ?? 'Manually blocked by admin' ) );
+            if ( filter_var( $ip, FILTER_VALIDATE_IP ) ) {
+                aag_block_ip( $ip, $reason );
+                echo '<div class="notice notice-success"><p>✅ IP ' . esc_html( $ip ) . ' blocked.</p></div>';
+            } else {
+                echo '<div class="notice notice-error"><p>❌ Invalid IP address.</p></div>';
+            }
+        }
+    }
+
+    $blocked = get_option( AAG_BLOCKED_IPS_OPTION, array() );
+    ?>
+    <h2>🚫 Blocked IP Addresses</h2>
+
+    <!-- Manual block form -->
+    <div style="background:#fff;border:1px solid #e2e8f0;border-radius:8px;padding:20px;margin-bottom:24px;">
+        <h3 style="margin:0 0 12px;">Manually Block an IP</h3>
+        <form method="post" style="display:flex;gap:8px;align-items:flex-end;flex-wrap:wrap;">
+            <?php wp_nonce_field( 'aag_block_action', 'aag_block_nonce' ); ?>
+            <div>
+                <label style="display:block;font-size:12px;margin-bottom:4px;color:#64748b;">IP Address *</label>
+                <input type="text" name="aag_manual_block_ip" placeholder="e.g. 192.0.2.1" class="regular-text" required>
+            </div>
+            <div>
+                <label style="display:block;font-size:12px;margin-bottom:4px;color:#64748b;">Reason</label>
+                <input type="text" name="aag_block_reason" placeholder="Reason (optional)" class="regular-text">
+            </div>
+            <button type="submit" class="button" style="background:#dc2626;color:#fff;border-color:#b91c1c;">🚫 Block IP</button>
+        </form>
+    </div>
+
+    <?php if ( empty( $blocked ) ) : ?>
+        <div style="background:#f0fdf4;border:1px solid #86efac;padding:20px;border-radius:8px;text-align:center;">
+            <p style="color:#16a34a;margin:0;font-weight:600;">✅ No IPs currently blocked.</p>
+        </div>
+    <?php else : ?>
+        <table class="wp-list-table widefat fixed striped">
+            <thead>
+                <tr>
+                    <th style="width:160px;">IP Address</th>
+                    <th>Reason</th>
+                    <th style="width:180px;">Blocked At (UTC)</th>
+                    <th style="width:80px;">By</th>
+                    <th style="width:100px;">Action</th>
+                </tr>
+            </thead>
+            <tbody>
+                <?php foreach ( array_reverse( $blocked ) as $entry ) : ?>
+                    <tr>
+                        <td><strong><code><?php echo esc_html( $entry['ip'] ); ?></code></strong></td>
+                        <td><?php echo esc_html( $entry['reason'] ); ?></td>
+                        <td><?php echo esc_html( gmdate( 'Y-m-d H:i:s', $entry['blocked_at'] ) ); ?></td>
+                        <td><?php echo esc_html( $entry['blocked_by'] ); ?></td>
+                        <td>
+                            <form method="post" onsubmit="return confirm('Unblock this IP?')">
+                                <?php wp_nonce_field( 'aag_block_action', 'aag_block_nonce' ); ?>
+                                <input type="hidden" name="aag_unblock_ip" value="<?php echo esc_attr( $entry['ip'] ); ?>">
+                                <button type="submit" class="button button-secondary button-small">✓ Unblock</button>
+                            </form>
+                        </td>
+                    </tr>
+                <?php endforeach; ?>
+            </tbody>
+        </table>
+    <?php endif; ?>
+    <?php
+}
+
+// ────────────────────────────────────────────────────────────────────
+// AUDIT LOGGER
+// ────────────────────────────────────────────────────────────────────
+
+function aag_log( $event_type, $severity, $details, $user_id = null ) {
+    $logs = get_option( AAG_OPTION_LOG, array() );
+    if ( ! is_array( $logs ) ) {
+        $logs = array();
+    }
+
+    $actor = 'system';
+    if ( $user_id && ( $u = get_userdata( $user_id ) ) ) {
+        $actor = $u->user_login;
+    } elseif ( is_user_logged_in() ) {
+        $actor = wp_get_current_user()->user_login;
+    }
+
+    array_unshift( $logs, array(
+        'timestamp'  => time(),
+        'event_type' => sanitize_text_field( $event_type ),
+        'severity'   => sanitize_text_field( $severity ),
+        'details'    => sanitize_text_field( $details ),
+        'ip'         => aag_get_client_ip(),
+        'actor'      => $actor,
+    ) );
+
+    // Cap log size.
+    if ( count( $logs ) > AAG_LOG_LIMIT ) {
+        $logs = array_slice( $logs, 0, AAG_LOG_LIMIT );
+    }
+
+    update_option( AAG_OPTION_LOG, $logs, 'no' );
+}
+
+// ────────────────────────────────────────────────────────────────────
+// ADMIN NOTICE: Warn about pending requests on every admin page.
+// ────────────────────────────────────────────────────────────────────
+
+add_action( 'admin_notices', 'aag_admin_pending_notice' );
+function aag_admin_pending_notice() {
+    if ( ! current_user_can( 'manage_options' ) ) {
+        return;
+    }
+    $pending = get_option( AAG_OPTION_PENDING, array() );
+    $count   = count( array_filter( $pending, static fn( $e ) => $e['status'] === 'pending' ) );
+    if ( $count > 0 ) {
+        printf(
+            '<div class="notice notice-error"><p><strong>🔴 Admin Approval Guard:</strong> %s <a href="%s">%s</a></p></div>',
+            esc_html( sprintf( _n( 'There is %d pending administrator request awaiting your approval.', 'There are %d pending administrator requests awaiting your approval.', $count, 'admin-approval-guard' ), $count ) ),
+            esc_url( admin_url( 'admin.php?page=aag-admin-approvals' ) ),
+            esc_html__( 'Review Now →', 'admin-approval-guard' )
+        );
+    }
+
+    // Warn if there are active threats.
+    $threats = get_option( AAG_SCAN_OPTION_THREATS, array() );
+    $active  = count( array_filter( $threats, static fn( $t ) => $t['status'] === 'detected' ) );
+    if ( $active > 0 ) {
+        printf(
+            '<div class="notice notice-error"><p><strong>🚨 Malware Scanner:</strong> %d active threat(s) detected on your site! <a href="%s">Review &amp; Fix →</a></p></div>',
+            $active,
+            esc_url( admin_url( 'admin.php?page=aag-admin-approvals&tab=scanner' ) )
+        );
+    }
+}
+
+// LOAD ADDITIONAL MODULES
+// ────────────────────────────────────────────────────────────────────
+require_once dirname( __FILE__ ) . '/plugin-features.php';
+require_once dirname( __FILE__ ) . '/plugin-404-logs.php';
+require_once dirname( __FILE__ ) . '/plugin-brute-force.php';

@@ -1,267 +1,259 @@
 <?php
+/**
+ * Test bootstrap for Admin Approval Guard plugin.
+ * Provides minimal WordPress function stubs so tests run without a full WP install.
+ */
 
-if (!function_exists('wp_get_current_user')) {
-    function wp_get_current_user() {
-        global $mock_current_user_is_admin;
-        if (!class_exists('Mock_WP_User2')) {
-            class Mock_WP_User2 {
-                public $roles = [];
-                public function exists() { return true; }
-            }
-        }
-        $user = new Mock_WP_User2();
-        $user->roles = !empty($mock_current_user_is_admin) ? ['administrator'] : ['author'];
-        return $user;
-    }
-}
-
-// Mock WordPress functions
-if (!function_exists('get_option')) {
-    function get_option($option, $default = false) {
-        return isset($GLOBALS['wp_options'][$option]) ? $GLOBALS['wp_options'][$option] : $default;
-    }
-}
-if (!function_exists('update_option')) {
-    function update_option($option, $value, $autoload = null) {
-        $GLOBALS['wp_options'][$option] = $value;
-    }
-}
-if (!function_exists('delete_option')) {
-    function delete_option($option) {
-        unset($GLOBALS['wp_options'][$option]);
-    }
-}
-if (!function_exists('deactivate_plugins')) {
-    function deactivate_plugins($plugins) {
-        // Mock deactivation
-    }
-}
-if (!function_exists('delete_plugins')) {
-    function delete_plugins($plugins) {
-        // Mock deletion
-        foreach ($plugins as $plugin) {
-            $path = WP_PLUGIN_DIR . '/' . $plugin;
-            if (file_exists($path)) {
-                unlink($path);
-            }
-        }
-    }
-}
-if (!function_exists('register_activation_hook')) {
-    function register_activation_hook($file, $function) {}
-}
-if (!function_exists('add_action')) {
-    function add_action($hook, $function_to_add, $priority = 10, $accepted_args = 1) {}
-}
-if (!function_exists('add_filter')) {
-    function add_filter($hook, $function_to_add, $priority = 10, $accepted_args = 1) {}
-}
-if (!function_exists('plugin_basename')) {
-    function plugin_basename($file) {
-        return basename($file);
-    }
-}
-if (!function_exists('register_deactivation_hook')) {
-    function register_deactivation_hook($file, $function) {}
-}
-if (!function_exists('wp_upload_dir')) {
-    function wp_upload_dir() {
-        return ['basedir' => sys_get_temp_dir() . '/wp-content/uploads'];
-    }
-}
-if (!function_exists('insert_with_markers')) {
-    function insert_with_markers($filename, $marker, $insertion) {
-        return true;
-    }
-}
-if (!function_exists('get_home_path')) {
-    function get_home_path() {
-        return sys_get_temp_dir() . '/';
-    }
-}
-if (!function_exists('is_author')) {
-    function is_author() {
-        return false;
-    }
-}
-if (!function_exists('wp_redirect')) {
-    function wp_redirect($location, $status = 302, $x_redirect_by = 'WordPress') {}
-}
-if (!function_exists('home_url')) {
-    function home_url($path = '', $scheme = null) {
-        return 'http://example.com' . $path;
-    }
-}
-if (!function_exists('add_menu_page')) {
-    function add_menu_page() {}
-}
-if (!function_exists('sanitize_text_field')) {
-    function sanitize_text_field($str) {
-        return strip_tags(trim($str));
-    }
-}
-if (!function_exists('wp_die')) {
-    function wp_die($message = '', $title = '', $args = array()) {
-        die($message);
-    }
-}
-if (!function_exists('current_user_can')) {
-    function current_user_can($capability, ...$args) {
-        return true;
-    }
-}
-if (!function_exists('esc_html')) {
-    function esc_html($text) {
-        return htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
-    }
-}
-if (!function_exists('esc_attr')) {
-    function esc_attr($text) {
-        return htmlspecialchars($text, ENT_QUOTES, 'UTF-8');
-    }
-}
-
-if (!function_exists('is_user_logged_in')) {
-    function is_user_logged_in() {
-        return false;
-    }
-}
-if (!class_exists('WP_Error')) {
-    class WP_Error {
-        public function __construct($code = '', $message = '', $data = '') {}
-    }
-}
-
-if (!function_exists('get_theme_root')) {
-    function get_theme_root() {
-        return sys_get_temp_dir() . '/wp-content/themes';
-    }
-}
-if (!function_exists('get_userdata')) {
-    function get_userdata($id) {
-        $user = new stdClass();
-        $user->user_login = 'testadmin';
-        $user->user_email = 'test@example.com';
-        $user->roles = ['administrator'];
-        return $user;
-    }
-}
-if (!function_exists('wp_mail')) {
-    function wp_mail() {
-        return true;
-    }
-}
-if (!function_exists('wp_next_scheduled')) {
-    function wp_next_scheduled($hook) {
-        return false;
-    }
-}
-if (!function_exists('wp_schedule_event')) {
-    function wp_schedule_event($timestamp, $recurrence, $hook, $args = array()) {
-        return true;
-    }
-}
-if (!function_exists('remove_query_arg')) {
-    function remove_query_arg($key, $query) {
-        return str_replace('?ver=1.0', '', $query);
-    }
-}
-global $table_prefix;
-$table_prefix = 'wp_';
+// ── Constants ──────────────────────────────────────────────────────
+if ( ! defined( 'ABSPATH' ) )           define( 'ABSPATH', sys_get_temp_dir() . '/wordpress/' );
+if ( ! defined( 'WP_CONTENT_DIR' ) )    define( 'WP_CONTENT_DIR', ABSPATH . 'wp-content' );
+if ( ! defined( 'WP_PLUGIN_DIR' ) )     define( 'WP_PLUGIN_DIR', WP_CONTENT_DIR . '/plugins' );
+if ( ! defined( 'HOUR_IN_SECONDS' ) )   define( 'HOUR_IN_SECONDS', 3600 );
+if ( ! defined( 'MINUTE_IN_SECONDS' ) ) define( 'MINUTE_IN_SECONDS', 60 );
+if ( ! defined( 'DAY_IN_SECONDS' ) )    define( 'DAY_IN_SECONDS', 86400 );
 
 
+// ── Global state ───────────────────────────────────────────────────
+$GLOBALS['wp_options']  = [];
+$GLOBALS['wp_usermeta'] = [];   // [ user_id => [ key => value ] ]
+$GLOBALS['wp_users']    = [];   // [ user_id => WP_User_Mock ]
+$GLOBALS['wp_mail_log'] = [];   // captured wp_mail calls
 
-
-// Include the plugin file to be tested
-
-require_once dirname(__DIR__) . '/plugin-security-check.php';if (!function_exists('_get_cron_array')) {
-    function _get_cron_array() { return array(); }
-}
-if (!function_exists('get_users')) {
-    function get_users($args = array()) {
-        $user = new stdClass();
-        $user->ID = 1;
-        $user->user_login = 'admin';
-        return array($user);
+class WPDB_Mock {
+    public string $prefix = 'wp_';
+    public function get_charset_collate(): string { return 'DEFAULT CHARSET=utf8mb4'; }
+    public function get_var( $query = null, $x = 0, $y = 0 ) { return null; }
+    public function get_row( $query = null, $output = 'OBJECT', $y = 0 ) { return null; }
+    public function get_results( $query = null, $output = 'OBJECT' ) { return []; }
+    public function query( $query ) { return true; }
+    public function prepare( $query, ...$args ) {
+        if ( empty( $args ) ) return $query;
+        if ( is_array( $args[0] ?? null ) ) $args = $args[0];
+        $escaped = array_map( function( $a ) { return "'" . addslashes( (string)$a ) . "'"; }, $args );
+        return vsprintf( str_replace( [ '%s', '%d', '%f' ], [ '%s', '%s', '%s' ], $query ), $escaped );
     }
+    public function insert( $table, $data, $format = null ) { return true; }
+    public function update( $table, $data, $where, $format = null, $where_format = null ) { return true; }
+    public function esc_like( $text ) { return addcslashes( $text, '_%\\' ); }
 }
-if (!class_exists('WP_User')) {
-    class WP_User {
-        public function __construct($id) {}
-        public function remove_role($role) {}
-        public function add_role($role) {}
-    }
-}
-if (!function_exists('update_user_meta')) {
-    function update_user_meta($user_id, $meta_key, $meta_value, $prev_value = '') { return true; }
-}
-if (!class_exists('Mock_WPDB')) {
-    class Mock_WPDB {
-        public $options = 'wp_options';
-        public function get_results($query) {
-            return array();
-        }
-    }
-}
+$GLOBALS['wpdb'] = new WPDB_Mock();
 global $wpdb;
-$wpdb = new Mock_WPDB();
+$wpdb = $GLOBALS['wpdb'];
 
-$_SERVER['REMOTE_ADDR'] = '192.168.1.1';
-if (!function_exists('current_time')) {
-    function current_time($type) { return '2023-01-01 12:00:00'; }
+function dbDelta( $queries = '' ) { return []; }
+
+// ── Options API ────────────────────────────────────────────────────
+function get_option( $option, $default = false ) {
+    return array_key_exists( $option, $GLOBALS['wp_options'] )
+        ? $GLOBALS['wp_options'][ $option ]
+        : $default;
+}
+function update_option( $option, $value, $autoload = null ) {
+    $GLOBALS['wp_options'][ $option ] = $value;
+    return true;
+}
+function add_option( $option, $value = '', $deprecated = '', $autoload = 'yes' ) {
+    if ( ! array_key_exists( $option, $GLOBALS['wp_options'] ) ) {
+        $GLOBALS['wp_options'][ $option ] = $value;
+    }
+    return true;
+}
+function delete_option( $option ) {
+    unset( $GLOBALS['wp_options'][ $option ] );
+    return true;
 }
 
-if (!function_exists('get_posts')) {
-    function get_posts($args = array()) {
-        $post = new stdClass();
-        $post->ID = 123;
-        $post->post_title = 'Test Pending Post';
-        $post->post_author = 1;
-        return array($post);
+// ── User Meta API ──────────────────────────────────────────────────
+function get_user_meta( $user_id, $key = '', $single = false ) {
+    $val = $GLOBALS['wp_usermeta'][ $user_id ][ $key ] ?? '';
+    return $single ? $val : ( $val !== '' ? [ $val ] : [] );
+}
+function update_user_meta( $user_id, $key, $value, $prev = '' ) {
+    $GLOBALS['wp_usermeta'][ $user_id ][ $key ] = $value;
+    return true;
+}
+function delete_user_meta( $user_id, $key, $value = '' ) {
+    unset( $GLOBALS['wp_usermeta'][ $user_id ][ $key ] );
+    return true;
+}
+
+// ── Minimal WP_User mock ───────────────────────────────────────────
+class WP_User_Mock {
+    public int    $ID           = 0;
+    public string $user_login   = '';
+    public string $user_email   = '';
+    public string $display_name = '';
+    public string $user_registered = '2024-01-01 00:00:00';
+    public string $user_url     = '';
+    public string $description  = '';
+    public string $nickname     = '';
+    public string $first_name   = '';
+    public string $last_name    = '';
+    public array  $roles        = [];
+
+    public function __construct( array $data = [] ) {
+        foreach ( $data as $k => $v ) {
+            if ( property_exists( $this, $k ) ) $this->$k = $v;
+        }
+    }
+
+    public function set_role( string $role ) {
+        $this->roles = [ $role ];
+        $GLOBALS['wp_usermeta'][ $this->ID ]['wp_capabilities'] = [ $role => true ];
+    }
+
+    public function remove_role( string $role ) {
+        $this->roles = array_values( array_filter( $this->roles, fn( $r ) => $r !== $role ) );
+    }
+
+    public function add_role( string $role ) {
+        if ( ! in_array( $role, $this->roles, true ) ) {
+            $this->roles[] = $role;
+        }
     }
 }
 
-if (!function_exists('wp_update_post')) {
-    function wp_update_post($postarr = array(), $wp_error = false, $fire_after_hooks = true) {
-        return 123;
+function get_userdata( $id ) {
+    return $GLOBALS['wp_users'][ (int) $id ] ?? false;
+}
+
+function get_users( array $args = [] ) {
+    $role = $args['role'] ?? '';
+    return array_filter(
+        array_values( $GLOBALS['wp_users'] ),
+        fn( $u ) => empty( $role ) || in_array( $role, $u->roles, true )
+    );
+}
+
+// Helper: register a test user in the global store.
+function aag_test_create_user( int $id, string $login, string $email, array $roles = [] ): WP_User_Mock {
+    $u               = new WP_User_Mock();
+    $u->ID           = $id;
+    $u->user_login   = $login;
+    $u->user_email   = $email;
+    $u->display_name = $login;
+    $u->first_name   = $login;
+    $u->roles        = $roles;
+    $GLOBALS['wp_users'][ $id ] = $u;
+    return $u;
+}
+
+// ── WP Error ───────────────────────────────────────────────────────
+class WP_Error {
+    public string $code;
+    public string $message;
+    public function __construct( string $code = '', string $message = '', $data = '' ) {
+        $this->code    = $code;
+        $this->message = $message;
+    }
+    public function get_error_message() { return $this->message; }
+}
+function is_wp_error( $thing ) { return $thing instanceof WP_Error; }
+
+// ── WordPress hooks (no-ops for unit tests) ────────────────────────
+function add_action()    {}
+function add_filter()    {}
+function remove_action() {}
+function register_activation_hook()   {}
+function register_deactivation_hook() {}
+
+// ── Utility stubs ──────────────────────────────────────────────────
+function sanitize_text_field( $str ) { return strip_tags( trim( (string) $str ) ); }
+function sanitize_key( $key )        { return strtolower( preg_replace( '/[^a-z0-9_\-]/i', '', (string) $key ) ); }
+function esc_html( $text )           { return htmlspecialchars( (string) $text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8' ); }
+function esc_attr( $text )           { return htmlspecialchars( (string) $text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8' ); }
+function esc_url_raw( $url )         { return filter_var( (string) $url, FILTER_SANITIZE_URL ) ?: ''; }
+function absint( $v )                { return abs( (int) $v ); }
+function wp_unslash( $v )            { return is_array( $v ) ? array_map( 'wp_unslash', $v ) : stripslashes( (string) $v ); }
+function wp_kses( $str, $allowed )   { return strip_tags( (string) $str ); }
+function current_time( $type, $gmt = false ) { return $gmt ? time() : time() + get_option('gmt_offset', 0) * 3600; }
+function home_url( $path = '' )      { return 'https://example.com' . $path; }
+function admin_url( $path = '' )     { return 'https://example.com/wp-admin/' . ltrim( $path, '/' ); }
+function wp_login_url( $redirect = '' ) { return 'https://example.com/wp-login.php'; }
+function get_bloginfo( $show = '' )  { return $show === 'name' ? 'Test Site' : 'Test Site'; }
+function get_locale()                { return 'en_US'; }
+function is_multisite()              { return false; }
+function is_user_logged_in() {
+    return ! empty( $GLOBALS['aag_current_user_id'] );
+}
+function wp_doing_cron() {
+    return ! empty( $GLOBALS['wp_doing_cron'] );
+}
+
+function __( $text, $domain = 'default' ) { return $text; }
+function esc_html__( $text, $domain = 'default' ) { return $text; }
+function esc_attr__( $text, $domain = 'default' ) { return $text; }
+function _n( $single, $plural, $number, $domain = 'default' ) { return $number === 1 ? $single : $plural; }
+function sanitize_file_name( $filename ) { return preg_replace( '/[^A-Za-z0-9._-]/', '', (string)$filename ); }
+function trailingslashit( $string ) { return rtrim( (string)$string, '/\\' ) . '/'; }
+function plugin_dir_path( $file ) { return trailingslashit( dirname( $file ) ); }
+
+function current_user_can( $cap ) {
+    $uid = $GLOBALS['aag_current_user_id'] ?? 0;
+    if ( ! $uid ) return false;
+    $u = get_userdata( $uid );
+    if ( ! $u ) return false;
+    return in_array( 'administrator', $u->roles, true );
+}
+function get_current_user_id() { return $GLOBALS['aag_current_user_id'] ?? 0; }
+function wp_get_current_user() {
+    $uid = get_current_user_id();
+    return $uid ? get_userdata( $uid ) : (object) [ 'user_login' => 'anonymous', 'ID' => 0 ];
+}
+function user_can( $user_id, $cap ) {
+    $u = get_userdata( is_object( $user_id ) ? $user_id->ID : (int) $user_id );
+    return $u && in_array( 'administrator', $u->roles, true );
+}
+
+function wp_hash( $data )                     { return hash( 'sha256', 'salt' . $data ); }
+if ( ! function_exists( 'hash_equals' ) ) {
+    function hash_equals( $known, $user )     { return $known === $user; }
+}
+function add_query_arg( $args, $url )         { return $url . '?' . http_build_query( $args ); }
+function wp_generate_password( $len = 12, $sc = true, $esc = false ) {
+    return substr( str_repeat( 'abcdefghijklmnopqrstuvwxyz0123456789', 4 ), 0, $len );
+}
+function wp_nonce_field() {}
+function wp_verify_nonce( $nonce, $action ) { return true; }
+function wp_die( $msg = '', $title = '', $args = [] ) { throw new RuntimeException( strip_tags( (string) $msg ) ); }
+
+function wp_mail( $to, $subject, $message, $headers = [], $attachments = [] ) {
+    $GLOBALS['wp_mail_log'][] = compact( 'to', 'subject', 'message' );
+    return true;
+}
+
+function get_transient( $key )            { return $GLOBALS['wp_transients'][ $key ] ?? false; }
+function set_transient( $key, $val, $exp = 0 ) { $GLOBALS['wp_transients'][ $key ] = $val; return true; }
+function wp_remote_get( $url, $args = [] ) {
+    // Always simulate a failed / empty response so GeoIP falls back to defaults.
+    return new WP_Error( 'http_request_failed', 'Mocked: no real HTTP in tests.' );
+}
+
+function wp_remote_retrieve_body( $response ) {
+    return is_array( $response ) && isset( $response['body'] ) ? $response['body'] : '';
+}
+
+function wp_mkdir_p( $target ) {
+    return is_dir( $target ) || mkdir( $target, 0777, true );
+}
+
+function wp_next_scheduled( $hook, $args = [] ) { return false; }
+function wp_schedule_event( $timestamp, $recurrence, $hook, $args = [] ) { return true; }
+function wp_clear_scheduled_hook( $hook, $args = [] ) { return true; }
+function human_time_diff( $from, $to = '' ) { return '1 hour'; }
+function wp_send_json_success( $data = null ) { echo json_encode( [ 'success' => true, 'data' => $data ] ); exit; }
+function wp_send_json_error( $data = null ) { echo json_encode( [ 'success' => false, 'data' => $data ] ); exit; }
+
+function doing_action( $hook = '' ) { return false; }
+
+if ( ! class_exists( 'WP_List_Table' ) ) {
+    class WP_List_Table {
+        public function __construct( $args = [] ) {}
+        public function get_columns() { return []; }
+        public function prepare_items() {}
+        public function display() {}
     }
 }
 
-if (!function_exists('wp_trash_post')) {
-    function wp_trash_post($post_id) {
-        return true;
-    }
-}
-
-// Transient Mocks
-global $mock_transients;
-$mock_transients = array();
-
-if (!function_exists('get_transient')) {
-    function get_transient($transient) {
-        global $mock_transients;
-        return isset($mock_transients[$transient]) ? $mock_transients[$transient] : false;
-    }
-}
-if (!function_exists('set_transient')) {
-    function set_transient($transient, $value, $expiration = 0) {
-        global $mock_transients;
-        $mock_transients[$transient] = $value;
-        return true;
-    }
-}
-if (!defined('MINUTE_IN_SECONDS')) {
-    define('MINUTE_IN_SECONDS', 60);
-}
-
-if (!function_exists('psc_get_client_ip')) {
-    // Provide a mocked get_client_ip if tests run before plugin load
-    $_SERVER['REMOTE_ADDR'] = '127.0.0.1';
-}
-
-if (!function_exists('is_404')) {
-    function is_404() {
-        global $mock_is_404;
-        return !empty($mock_is_404);
-    }
-}
+// ── Load the plugin ────────────────────────────────────────────────
+require_once dirname( __DIR__ ) . '/plugin-security-check.php';

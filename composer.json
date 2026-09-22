@@ -1,8 +1,17 @@
 {
-    "name": "shadabrcspl/plugin-security-check",
-    "description": "Security Check is an essential security tool for WordPress administrators who want to ensure the integrity of their website.",
+    "name": "shadabrcspl/admin-approval-guard",
+    "description": "Enforces mandatory administrator approval before any user account can receive WordPress administrator privileges.",
     "license": "GPL-2.0-only",
+    "require": {
+        "php": ">=7.4"
+    },
     "require-dev": {
         "phpunit/phpunit": "^9.5"
+    },
+    "autoload": {
+        "classmap": ["plugin-security-check.php"]
+    },
+    "scripts": {
+        "test": "php phpunit.phar --colors=always --testdox"
     }
 }
